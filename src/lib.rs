@@ -2,70 +2,60 @@ pub mod ffi;
 
 use nix::errno::Errno;
 use nix::sys::socket::SockAddr;
-pub use rdma_event::RdmaCmEvent;
 use std::convert::TryFrom;
 use std::ffi::{c_void, CString};
 use std::mem::MaybeUninit;
 
+use std::borrow::Borrow;
+use std::cell::RefCell;
 use std::ptr::{null, null_mut};
 
-// Use module to bring all symbols into scope for the mod. Avoids having "ffi::" in our enum.
-mod rdma_event {
-    use crate::ffi::*;
-    use std::convert::TryFrom;
-
-    /// Direct translation of rdma cm event types into an enum. Use the bindgen values to ensure our
-    /// events are correctly labeled even if they change in a different header version.
-    #[derive(Eq, PartialEq, Debug)]
-    pub enum RdmaCmEvent {
-        AddressResolved = rdma_cm_event_type_RDMA_CM_EVENT_ADDR_RESOLVED as isize,
-        AddressError = rdma_cm_event_type_RDMA_CM_EVENT_ADDR_ERROR as isize,
-        RouteResolved = rdma_cm_event_type_RDMA_CM_EVENT_ROUTE_RESOLVED as isize,
-        RouteError = rdma_cm_event_type_RDMA_CM_EVENT_ROUTE_ERROR as isize,
-        ConnectionRequest = rdma_cm_event_type_RDMA_CM_EVENT_CONNECT_REQUEST as isize,
-        ConnectionResponse = rdma_cm_event_type_RDMA_CM_EVENT_CONNECT_RESPONSE as isize,
-        ConnectionError = rdma_cm_event_type_RDMA_CM_EVENT_CONNECT_ERROR as isize,
-        Unreachable = rdma_cm_event_type_RDMA_CM_EVENT_UNREACHABLE as isize,
-        Rejected = rdma_cm_event_type_RDMA_CM_EVENT_REJECTED as isize,
-        Established = rdma_cm_event_type_RDMA_CM_EVENT_ESTABLISHED as isize,
-        Disconnected = rdma_cm_event_type_RDMA_CM_EVENT_DISCONNECTED as isize,
-        DeviceRemoval = rdma_cm_event_type_RDMA_CM_EVENT_DEVICE_REMOVAL as isize,
-        MulticastJoin = rdma_cm_event_type_RDMA_CM_EVENT_MULTICAST_JOIN as isize,
-        MulticastError = rdma_cm_event_type_RDMA_CM_EVENT_MULTICAST_ERROR as isize,
-        AddressChange = rdma_cm_event_type_RDMA_CM_EVENT_ADDR_CHANGE as isize,
-        TimewaitExit = rdma_cm_event_type_RDMA_CM_EVENT_TIMEWAIT_EXIT as isize,
-    }
-
-    #[allow(non_upper_case_globals)]
-    impl TryFrom<u32> for RdmaCmEvent {
-        type Error = String;
-        fn try_from(n: u32) -> Result<Self, Self::Error> {
-            use RdmaCmEvent::*;
-
-            let event = match n {
-                rdma_cm_event_type_RDMA_CM_EVENT_ADDR_RESOLVED => AddressResolved,
-                rdma_cm_event_type_RDMA_CM_EVENT_ROUTE_RESOLVED => RouteResolved,
-                rdma_cm_event_type_RDMA_CM_EVENT_ROUTE_ERROR => RouteError,
-                rdma_cm_event_type_RDMA_CM_EVENT_CONNECT_REQUEST => ConnectionRequest,
-                rdma_cm_event_type_RDMA_CM_EVENT_CONNECT_RESPONSE => ConnectionResponse,
-                rdma_cm_event_type_RDMA_CM_EVENT_CONNECT_ERROR => ConnectionError,
-                rdma_cm_event_type_RDMA_CM_EVENT_UNREACHABLE => Unreachable,
-                rdma_cm_event_type_RDMA_CM_EVENT_REJECTED => Rejected,
-                rdma_cm_event_type_RDMA_CM_EVENT_ESTABLISHED => Established,
-                rdma_cm_event_type_RDMA_CM_EVENT_DISCONNECTED => Disconnected,
-                rdma_cm_event_type_RDMA_CM_EVENT_DEVICE_REMOVAL => DeviceRemoval,
-                rdma_cm_event_type_RDMA_CM_EVENT_MULTICAST_JOIN => MulticastJoin,
-                _ => return Err(format!("Invalid integer: {}", n)),
-            };
-
-            Ok(event)
-        }
-    }
+/// Direct translation of rdma cm event types into an enum. Use the bindgen values to ensure our
+/// events are correctly labeled even if they change in a different header version.
+#[derive(Eq, PartialEq, Debug)]
+pub enum RdmaCmEvent {
+    AddressResolved,
+    AddressError,
+    RouteResolved,
+    RouteError,
+    ConnectionRequest,
+    ConnectionResponse,
+    ConnectionError,
+    Unreachable,
+    Rejected,
+    Established,
+    Disconnected,
+    DeviceRemoval,
+    MulticastJoin,
+    MulticastError,
+    AddressChange,
+    TimewaitExit,
 }
 
-/// Uses rdma-cm to manage multiple connections.
-pub struct RdmaRouter {
-    cm_id: *mut ffi::rdma_cm_id,
+#[allow(non_upper_case_globals)]
+impl TryFrom<u32> for RdmaCmEvent {
+    type Error = String;
+    fn try_from(n: u32) -> Result<Self, Self::Error> {
+        use RdmaCmEvent::*;
+
+        let event = match n {
+            ffi::rdma_cm_event_type_RDMA_CM_EVENT_ADDR_RESOLVED => AddressResolved,
+            ffi::rdma_cm_event_type_RDMA_CM_EVENT_ROUTE_RESOLVED => RouteResolved,
+            ffi::rdma_cm_event_type_RDMA_CM_EVENT_ROUTE_ERROR => RouteError,
+            ffi::rdma_cm_event_type_RDMA_CM_EVENT_CONNECT_REQUEST => ConnectionRequest,
+            ffi::rdma_cm_event_type_RDMA_CM_EVENT_CONNECT_RESPONSE => ConnectionResponse,
+            ffi::rdma_cm_event_type_RDMA_CM_EVENT_CONNECT_ERROR => ConnectionError,
+            ffi::rdma_cm_event_type_RDMA_CM_EVENT_UNREACHABLE => Unreachable,
+            ffi::rdma_cm_event_type_RDMA_CM_EVENT_REJECTED => Rejected,
+            ffi::rdma_cm_event_type_RDMA_CM_EVENT_ESTABLISHED => Established,
+            ffi::rdma_cm_event_type_RDMA_CM_EVENT_DISCONNECTED => Disconnected,
+            ffi::rdma_cm_event_type_RDMA_CM_EVENT_DEVICE_REMOVAL => DeviceRemoval,
+            ffi::rdma_cm_event_type_RDMA_CM_EVENT_MULTICAST_JOIN => MulticastJoin,
+            _ => return Err(format!("Invalid integer: {}", n)),
+        };
+
+        Ok(event)
+    }
 }
 
 /// This is a single event.
@@ -79,14 +69,12 @@ impl CmEvent {
         TryFrom::try_from(e).expect("Unable to convert event integer to enum.")
     }
 
-    pub fn get_connection_request_id(&self) -> RdmaRouter {
+    pub fn get_connection_request_id(&self) -> CommunicatioManager {
         if self.get_event() != RdmaCmEvent::ConnectionRequest {
             panic!("get_connection_request_id only makes sense for ConnectRequest event!");
         }
         let cm_id = unsafe { (*self.event).id };
-        RdmaRouter {
-            cm_id,
-        }
+        CommunicatioManager { cm_id }
     }
 
     pub fn ack(self) -> () {
@@ -109,15 +97,18 @@ pub struct CompletionQueue {
     cq: *mut ffi::ibv_cq,
     // Buffer to hold entries from cq polling.
     // TODO: Make parametric over N (entries).
-    buffer: [ffi::ibv_wc; 20],
-}
-
-pub struct WorkCompletion {
-    wc: ffi::ibv_wc,
+    // There is a tiny cost overhead associated with this RefCell. Probably not worth optimizing
+    // out in exchange for unsafe code?
+    // buffer: RefCell<[ffi::ibv_wc; 20]>,
 }
 
 impl CompletionQueue {
-    pub fn poll(&mut self) -> Option<&[ffi::ibv_wc]> {
+    // TODO this will panic if we poll() while user still has reference to the returned value.
+    // TODO yuck get rid of uncessary box.
+    pub fn poll(&self) -> Option<Vec<ffi::ibv_wc>> {
+        // zeroed out.
+        let mut buffer: [ffi::ibv_wc; 20] = unsafe { std::mem::zeroed() };
+
         let poll_cq = unsafe {
             (*(*self.cq).context)
                 .ops
@@ -125,14 +116,14 @@ impl CompletionQueue {
                 .expect("Function pointer for post_send missing?")
         };
 
-        let ret = unsafe { poll_cq(self.cq, self.buffer.len() as i32, self.buffer.as_mut_ptr()) };
+        let ret = unsafe { poll_cq(self.cq, buffer.len() as i32, buffer.as_mut_ptr()) };
         if ret < 0 {
             panic!("polling cq failed.");
         }
         if ret == 0 {
             return None;
         } else {
-            Some(&self.buffer[0..ret as usize])
+            Some(buffer[0..ret as usize].to_vec())
         }
     }
 }
@@ -219,7 +210,12 @@ impl QueuePair {
     }
 }
 
-impl RdmaRouter {
+/// Uses rdma-cm to manage multiple connections.
+pub struct CommunicatioManager {
+    cm_id: *mut ffi::rdma_cm_id,
+}
+
+impl CommunicatioManager {
     fn get_raw_verbs_context(&mut self) -> *mut ffi::ibv_context {
         let context = unsafe { (*self.cm_id).verbs };
         assert_ne!(null_mut(), context, "Context was found to be null!");
@@ -242,10 +238,12 @@ impl RdmaRouter {
             panic!("Unable to create_qp");
         }
 
-        let buffer: [ffi::ibv_wc; 20] = unsafe { std::mem::zeroed() };
-        CompletionQueue { cq, buffer }
+        CompletionQueue { cq }
     }
 
+    // TODO: Currently we require the use to plz not drop this memory. We should be able to use
+    // lifetimes/ownership to assert this at compile time.
+    #[must_use = "Please refer to the registered memory via the returned `MemoryRegion`"]
     pub fn register_memory(&mut self, pd: &ProtectionDomain, memory: &mut [u8]) -> MemoryRegion {
         let mr = unsafe {
             ffi::ibv_reg_mr(
@@ -278,9 +276,8 @@ impl RdmaRouter {
             qp_type: ffi::ibv_qp_type_IBV_QPT_RC,
             sq_sig_all: 0,
         };
-        let ret = unsafe {
-            ffi::rdma_create_qp(self.cm_id, pd.pd, &qp_init_attr as *const _ as *mut _)
-        };
+        let ret =
+            unsafe { ffi::rdma_create_qp(self.cm_id, pd.pd, &qp_init_attr as *const _ as *mut _) };
         if ret == -1 {
             panic!("create_queue_pairs failed!");
         }
@@ -311,9 +308,7 @@ impl RdmaRouter {
         }
 
         let id: *mut ffi::rdma_cm_id = unsafe { id.assume_init() };
-        RdmaRouter {
-            cm_id: id,
-        }
+        CommunicatioManager { cm_id: id }
     }
 
     pub fn connect(&self) {
@@ -329,9 +324,8 @@ impl RdmaRouter {
             srq: 0,
             qp_num: 0,
         };
-        let ret = unsafe {
-            ffi::rdma_connect(self.cm_id, &connection_parameters as *const _ as *mut _)
-        };
+        let ret =
+            unsafe { ffi::rdma_connect(self.cm_id, &connection_parameters as *const _ as *mut _) };
         if ret == -1 {
             panic!("connect failed");
         }
@@ -350,15 +344,14 @@ impl RdmaRouter {
             srq: 0,
             qp_num: 0,
         };
-        let ret = unsafe {
-            ffi::rdma_accept(self.cm_id, &connection_parameters as *const _ as *mut _)
-        };
+        let ret =
+            unsafe { ffi::rdma_accept(self.cm_id, &connection_parameters as *const _ as *mut _) };
         if ret == -1 {
             panic!("accept failed");
         }
     }
 
-    pub fn bind(&self, socket_address: SockAddr) {
+    pub fn bind(&self, socket_address: &SockAddr) {
         let (addr, _len) = socket_address.as_ffi_pair();
 
         let ret = unsafe { ffi::rdma_bind_addr(self.cm_id, addr as *const _ as *mut _) };
@@ -376,6 +369,7 @@ impl RdmaRouter {
         }
     }
 
+    // TODO wrap return value higher level interface. probably iterator!
     pub fn get_addr_info() -> *mut ffi::rdma_addrinfo {
         // TODO Hardcoded to the address of prometheus10
         let addr = CString::new("198.19.2.10").unwrap();
@@ -399,11 +393,7 @@ impl RdmaRouter {
         unsafe { address_info.assume_init() }
     }
 
-    pub fn resolve_addr(
-        &self,
-        src_addr: Option<SockAddr>,
-        dst_addr: *mut ffi::sockaddr,
-    ) -> i32 {
+    pub fn resolve_addr(&self, src_addr: Option<SockAddr>, dst_addr: *mut ffi::sockaddr) -> i32 {
         assert_ne!(dst_addr, null_mut(), "dst_addr is null!");
         unsafe { ffi::rdma_resolve_addr(self.cm_id, null_mut(), dst_addr, 0) }
     }
@@ -418,8 +408,7 @@ impl RdmaRouter {
 
     pub fn get_cm_event(&self) -> CmEvent {
         let mut cm_events: MaybeUninit<*mut ffi::rdma_cm_event> = MaybeUninit::uninit();
-        let ret =
-            unsafe { ffi::rdma_get_cm_event((*self.cm_id).channel, cm_events.as_mut_ptr()) };
+        let ret = unsafe { ffi::rdma_get_cm_event((*self.cm_id).channel, cm_events.as_mut_ptr()) };
         if ret == -1 {
             panic!("get_cm_event failed!");
         }

@@ -1,10 +1,10 @@
-use rdma_cm;
 use nix::sys::socket::IpAddr;
 use nix::sys::socket::{InetAddr, SockAddr};
+use rdma_cm;
+use rdma_cm::{CommunicatioManager, RdmaCmEvent};
 use std::ptr::null_mut;
 use std::str::FromStr;
 use structopt::StructOpt;
-use rdma_cm::{RdmaCmEvent, RdmaRouter};
 
 #[derive(Debug)]
 enum Mode {
@@ -19,15 +19,15 @@ impl FromStr for Mode {
         match s {
             "Client" | "client" => Ok(Mode::Client),
             "Server" | "server" => Ok(Mode::Server),
-            _ => Err("Unknown mode. Avaliable modes: 'client', 'server'."),
+            _ => Err("Unknown mode. Available modes: 'client', 'server'."),
         }
     }
 }
 
 #[derive(Debug, StructOpt)]
 #[structopt(
-name = "RMDA CM Client/Server",
-about = "Example RDMA CM Client/Server Program."
+    name = "RMDA CM Client/Server",
+    about = "Example RDMA CM Client/Server Program."
 )]
 struct Opt {
     #[structopt(short, long)]
@@ -39,13 +39,13 @@ fn main() {
     match opt.mode {
         Mode::Server => {
             println!("Creating channel and device id.");
-            let listening_id = RdmaRouter::new();
+            let listening_id = CommunicatioManager::new();
 
             // Bind to local host.
             let addr = SockAddr::Inet(InetAddr::new(IpAddr::new_v4(127, 0, 0, 1), 4000));
 
             println!("Server: Binding to port.");
-            listening_id.bind(addr);
+            listening_id.bind(&addr);
 
             println!("Server: Listening for connection...");
             listening_id.listen();
@@ -90,10 +90,10 @@ fn main() {
         }
         Mode::Client => {
             println!("Creating channel and device id.");
-            let mut cm_connection = RdmaRouter::new();
+            let mut cm_connection = CommunicatioManager::new();
 
             println!("Client: Reading address info...");
-            let addr_info = RdmaRouter::get_addr_info();
+            let addr_info = CommunicatioManager::get_addr_info();
 
             unsafe {
                 let mut current = addr_info;
