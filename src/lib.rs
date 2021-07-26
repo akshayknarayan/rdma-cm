@@ -6,9 +6,10 @@ use std::convert::TryFrom;
 use std::ffi::{c_void, CString};
 use std::mem::MaybeUninit;
 
-use std::borrow::Borrow;
+use std::borrow::{Borrow, BorrowMut};
 use std::cell::RefCell;
 use std::ptr::{null, null_mut};
+use std::ops::Deref;
 
 /// Direct translation of rdma cm event types into an enum. Use the bindgen values to ensure our
 /// events are correctly labeled even if they change in a different header version.
@@ -40,6 +41,7 @@ impl TryFrom<u32> for RdmaCmEvent {
 
         let event = match n {
             ffi::rdma_cm_event_type_RDMA_CM_EVENT_ADDR_RESOLVED => AddressResolved,
+            ffi::rdma_cm_event_type_RDMA_CM_EVENT_ADDR_ERROR => AddressError,
             ffi::rdma_cm_event_type_RDMA_CM_EVENT_ROUTE_RESOLVED => RouteResolved,
             ffi::rdma_cm_event_type_RDMA_CM_EVENT_ROUTE_ERROR => RouteError,
             ffi::rdma_cm_event_type_RDMA_CM_EVENT_CONNECT_REQUEST => ConnectionRequest,
@@ -51,7 +53,10 @@ impl TryFrom<u32> for RdmaCmEvent {
             ffi::rdma_cm_event_type_RDMA_CM_EVENT_DISCONNECTED => Disconnected,
             ffi::rdma_cm_event_type_RDMA_CM_EVENT_DEVICE_REMOVAL => DeviceRemoval,
             ffi::rdma_cm_event_type_RDMA_CM_EVENT_MULTICAST_JOIN => MulticastJoin,
-            _ => return Err(format!("Invalid integer: {}", n)),
+            ffi::rdma_cm_event_type_RDMA_CM_EVENT_MULTICAST_ERROR => MulticastError,
+            ffi::rdma_cm_event_type_RDMA_CM_EVENT_ADDR_CHANGE => AddressChange,
+            ffi::rdma_cm_event_type_RDMA_CM_EVENT_TIMEWAIT_EXIT => TimewaitExit,
+            _ => return Err(format!("Unrecognized RDMA cm event value: {}", n)),
         };
 
         Ok(event)
@@ -77,6 +82,32 @@ impl CmEvent {
         CommunicatioManager { cm_id }
     }
 
+    pub fn get_private_data<T: 'static + Copy>(&self) -> Option<T> {
+        // TODO: Add other events here?
+        match self.get_event() {
+            RdmaCmEvent::ConnectionRequest | RdmaCmEvent::Established => {}
+            other => {
+                panic!("get_private_data not supported for {:?} event.", self.get_event());
+            }
+        }
+
+        let private_data: *const c_void = unsafe { (*self.event).param.conn.private_data };
+        let private_data_length: u8 = unsafe { (*self.event).param.conn.private_data_len };
+
+        // TODO Is there a better way to check the size of the data? This current check is very weak
+        // but private_data_length is pretty much useless from the receiver end...
+        // We could always tack on the size of the private data as a integer in our private data...
+        if std::mem::size_of::<T>() > private_data_length as usize {
+            panic!("Size of specified type ({:?}) does not match size of actual data: ({:?}) !", std::mem::size_of::<T>(), private_data_length);
+        }
+
+        if private_data.is_null() {
+            None
+        } else {
+            Some(unsafe { *(private_data as *mut T) })
+        }
+    }
+
     pub fn ack(self) -> () {
         let ret = unsafe { ffi::rdma_ack_cm_event(self.event) };
         if ret == -1 {
@@ -87,6 +118,12 @@ impl CmEvent {
 
 pub struct MemoryRegion {
     mr: *mut ffi::ibv_mr,
+}
+
+impl MemoryRegion {
+    pub fn get_rkey(&self) -> u32 {
+        unsafe { (*self.mr).rkey }
+    }
 }
 
 pub struct ProtectionDomain {
@@ -215,6 +252,7 @@ pub struct CommunicatioManager {
     cm_id: *mut ffi::rdma_cm_id,
 }
 
+
 impl CommunicatioManager {
     fn get_raw_verbs_context(&mut self) -> *mut ffi::ibv_context {
         let context = unsafe { (*self.cm_id).verbs };
@@ -244,12 +282,32 @@ impl CommunicatioManager {
     // TODO: Currently we require the use to plz not drop this memory. We should be able to use
     // lifetimes/ownership to assert this at compile time.
     #[must_use = "Please refer to the registered memory via the returned `MemoryRegion`"]
-    pub fn register_memory(&mut self, pd: &ProtectionDomain, memory: &mut [u8]) -> MemoryRegion {
+    pub fn register_memory_buffer<T>(&mut self, pd: &ProtectionDomain, memory: &mut Box<[T]>) -> MemoryRegion {
         let mr = unsafe {
             ffi::ibv_reg_mr(
                 pd.pd as *const _ as *mut _,
-                memory.as_mut_ptr() as *mut c_void,
-                memory.len() as u64,
+                memory.as_mut_ptr() as *mut _,
+                (memory.len() * std::mem::size_of::<T>()) as u64,
+                ffi::ibv_access_flags_IBV_ACCESS_LOCAL_WRITE as i32,
+            )
+        };
+        if mr == null_mut() {
+            panic!("Unable to register_memory");
+        }
+
+        MemoryRegion { mr }
+    }
+
+    // TODO: Currently we require the use to plz not drop this memory. We should be able to use
+    // lifetimes/ownership to assert this at compile time.
+    #[must_use = "Please refer to the registered memory via the returned `MemoryRegion`"]
+    pub unsafe fn register_memory<T>(pd: &ProtectionDomain, memory: &mut Box<T>) -> MemoryRegion {
+        let ptr = memory.as_mut() as *mut T;
+        let mr = unsafe {
+            ffi::ibv_reg_mr(
+                pd.pd as *const _ as *mut _,
+                ptr as *mut c_void,
+                std::mem::size_of::<T>() as u64,
                 ffi::ibv_access_flags_IBV_ACCESS_LOCAL_WRITE as i32,
             )
         };
@@ -311,11 +369,12 @@ impl CommunicatioManager {
         CommunicatioManager { cm_id: id }
     }
 
-    pub fn connect(&self) {
-        // TODO What are the right values for these parameters?
+    pub fn connect<T: 'static>(&self, private_data: Option<&T>) {
+        let (ptr, data_size) = CommunicatioManager::check_private_data(private_data);
+        dbg!(ptr, data_size);
         let connection_parameters = ffi::rdma_conn_param {
-            private_data: null(),
-            private_data_len: 0,
+            private_data: ptr,
+            private_data_len: data_size,
             responder_resources: 1,
             initiator_depth: 1,
             flow_control: 0,
@@ -331,11 +390,21 @@ impl CommunicatioManager {
         }
     }
 
-    pub fn accept(&self) {
+    /// Convert the passed private data into its pointer and length. Returns (null, 0) if None.
+    fn check_private_data<T: 'static>(private_data: Option<&T>) -> (*mut c_void, u8){
+        let ptr = private_data.map(|data| data as *const _ as *mut T as *mut c_void).unwrap_or(null_mut());
+        assert!(std::mem::size_of::<T>() < u8::MAX.into(), "private data too large!");
+        let data_size = if ptr.is_null() { 0 } else { std::mem::size_of::<T>() };
+        (ptr, data_size as u8)
+    }
+
+    pub fn accept<T: 'static>(&self, private_data: Option<&T>) {
+        let (ptr, data_size) = CommunicatioManager::check_private_data(private_data);
+
         // TODO What are the right values for these parameters?
         let connection_parameters = ffi::rdma_conn_param {
-            private_data: null(),
-            private_data_len: 0,
+            private_data: ptr,
+            private_data_len: data_size,
             responder_resources: 1,
             initiator_depth: 1,
             flow_control: 0,
