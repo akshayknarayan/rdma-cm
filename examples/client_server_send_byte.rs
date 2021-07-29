@@ -1,7 +1,8 @@
 use nix::sys::socket::IpAddr;
 use nix::sys::socket::{InetAddr, SockAddr};
 use rdma_cm;
-use rdma_cm::{CommunicatioManager, RdmaCmEvent};
+use rdma_cm::{CommunicatioManager, MemoryRegion, RdmaCmEvent, RegisteredMemoryRef};
+use std::ops::{Deref, DerefMut};
 use std::ptr::null_mut;
 use std::str::FromStr;
 use structopt::StructOpt;
@@ -62,18 +63,20 @@ fn main() {
             let mut qp = connected_id.create_qp(&pd, &cq);
 
             println!("Server: Accepting client connection.");
-            connected_id.accept();
+            connected_id.accept::<()>(None);
 
             let event = listening_id.get_cm_event();
             assert_eq!(RdmaCmEvent::Established, event.get_event());
             event.ack();
             println!("Acked Established.");
 
-            let mut v: Vec<u8> = Vec::from([0]);
-            let mut mr = connected_id.register_memory(&pd, &mut v);
+            let mut v = Vec::from([0]).into_boxed_slice();
+            let mut mr = CommunicatioManager::register_memory_buffer(&pd, &mut v);
+            let memory_reference = RegisteredMemoryRef::new(mr.get_lkey(), v);
             println!("pd, cq, and mr allocated!");
+            let work = vec![(2, &memory_reference)];
 
-            qp.post_receive(&mut mr, 2);
+            qp.post_receive(work.into_iter());
             loop {
                 match cq.poll() {
                     None => {}
@@ -81,7 +84,7 @@ fn main() {
                         for e in entries {
                             assert_eq!(2, e.wr_id, "Incorrect work request id.");
                             println!("Value received!");
-                            println!("{:?}", v);
+                            println!("{:?}", memory_reference.deref());
                             return;
                         }
                     }
@@ -128,16 +131,19 @@ fn main() {
             let mut qp = cm_connection.create_qp(&pd, &cq);
 
             println!("Client: Connecting.");
-            cm_connection.connect();
+            cm_connection.connect::<()>(None);
 
             let event = cm_connection.get_cm_event();
             assert_eq!(RdmaCmEvent::Established, event.get_event());
 
-            let mut v: Vec<u8> = Vec::from([42]);
-            let mut mr = cm_connection.register_memory(&pd, &mut v);
+            let mut v = Vec::from([42]).into_boxed_slice();
+            let mut mr = CommunicatioManager::register_memory_buffer(&pd, &mut v);
+            let memory_reference = RegisteredMemoryRef::new(mr.get_lkey(), v);
             println!("pd, cq, and mr allocated!");
 
-            qp.post_send(&mut mr, 1);
+            let work = vec![(1, &memory_reference)];
+
+            qp.post_send(work.into_iter());
             loop {
                 match cq.poll() {
                     None => {}

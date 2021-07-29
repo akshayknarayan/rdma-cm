@@ -8,8 +8,9 @@ use std::mem::MaybeUninit;
 
 use std::borrow::{Borrow, BorrowMut};
 use std::cell::RefCell;
-use std::ptr::{null, null_mut};
 use std::ops::Deref;
+use std::ops::DerefMut;
+use std::ptr::{null, null_mut};
 
 /// Direct translation of rdma cm event types into an enum. Use the bindgen values to ensure our
 /// events are correctly labeled even if they change in a different header version.
@@ -87,7 +88,10 @@ impl CmEvent {
         match self.get_event() {
             RdmaCmEvent::ConnectionRequest | RdmaCmEvent::Established => {}
             other => {
-                panic!("get_private_data not supported for {:?} event.", self.get_event());
+                panic!(
+                    "get_private_data not supported for {:?} event.",
+                    self.get_event()
+                );
             }
         }
 
@@ -98,7 +102,11 @@ impl CmEvent {
         // but private_data_length is pretty much useless from the receiver end...
         // We could always tack on the size of the private data as a integer in our private data...
         if std::mem::size_of::<T>() > private_data_length as usize {
-            panic!("Size of specified type ({:?}) does not match size of actual data: ({:?}) !", std::mem::size_of::<T>(), private_data_length);
+            panic!(
+                "Size of specified type ({:?}) does not match size of actual data: ({:?}) !",
+                std::mem::size_of::<T>(),
+                private_data_length
+            );
         }
 
         if private_data.is_null() {
@@ -117,12 +125,45 @@ impl CmEvent {
 }
 
 pub struct MemoryRegion {
-    mr: *mut ffi::ibv_mr,
+    pub mr: *mut ffi::ibv_mr,
 }
 
 impl MemoryRegion {
+    pub fn inner(&self) -> ffi::ibv_mr {
+        unsafe { *self.mr }
+    }
+
     pub fn get_rkey(&self) -> u32 {
-        unsafe { (*self.mr).rkey }
+        self.inner().rkey
+    }
+
+    pub fn get_lkey(&self) -> u32 {
+        self.inner().lkey
+    }
+}
+
+pub struct RegisteredMemoryRef {
+    lkey: u32,
+    mem: Box<[u8]>,
+}
+
+impl RegisteredMemoryRef {
+    pub fn new(lkey: u32, mem: Box<[u8]>) -> RegisteredMemoryRef {
+        RegisteredMemoryRef { lkey, mem }
+    }
+}
+
+impl Deref for RegisteredMemoryRef {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        self.mem.deref()
+    }
+}
+
+impl DerefMut for RegisteredMemoryRef {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.mem.deref_mut()
     }
 }
 
@@ -170,24 +211,44 @@ pub struct QueuePair {
 }
 
 impl QueuePair {
-    pub fn post_send(&mut self, mr: &mut MemoryRegion, wr_id: u64) {
-        let mr = unsafe { *mr.mr };
-        let sge = ffi::ibv_sge {
-            addr: mr.addr as u64,
-            length: mr.length as u32,
-            lkey: mr.lkey,
-        };
+    pub fn post_send<'a, I>(&mut self, work_requests: I)
+    where
+        I: Iterator<Item = (u64, &'a RegisteredMemoryRef)> + ExactSizeIterator,
+    {
+        if work_requests.len() == 0 {
+            panic!("memory regions empty! nothing to do4");
+        }
 
-        let work_request: ffi::ibv_send_wr = unsafe { std::mem::zeroed() };
-        let work_request = ffi::ibv_send_wr {
-            wr_id,
-            next: null_mut(),
-            sg_list: &sge as *const _ as *mut _,
-            num_sge: 1,
-            opcode: ffi::ibv_wr_opcode_IBV_WR_SEND,
-            send_flags: ffi::ibv_send_flags_IBV_SEND_SIGNALED,
-            ..work_request
-        };
+        // Create linked list of memory regions.
+        let work_request_template: ffi::ibv_send_wr = unsafe { std::mem::zeroed() };
+
+        // Maybe stack allocate to avoid allocation cost?
+        let mut requests: Vec<ffi::ibv_send_wr> = Vec::with_capacity(work_requests.len());
+        let mut sges: Vec<ffi::ibv_sge> = Vec::with_capacity(work_requests.len());
+
+        // Create all entries to fill `sges` and `requests`
+        for (i, (work_id, memory_ref)) in work_requests.enumerate() {
+            sges.push(ffi::ibv_sge {
+                addr: memory_ref.mem.deref() as *const [u8] as *const u8 as u64,
+                length: memory_ref.mem.len() as u32,
+                lkey: memory_ref.lkey,
+            });
+
+            requests.push(ffi::ibv_send_wr {
+                wr_id: work_id,
+                sg_list: &mut sges[i] as *mut _,
+                num_sge: 1,
+                opcode: ffi::ibv_wr_opcode_IBV_WR_SEND,
+                send_flags: ffi::ibv_send_flags_IBV_SEND_SIGNALED,
+                ..work_request_template
+            });
+        }
+
+        // Link all entries together.
+        for i in 0..requests.len() - 1 {
+            requests[i].next = &mut requests[i + 1] as *mut ffi::ibv_send_wr;
+        }
+
         let mut bad_wr: MaybeUninit<*mut ffi::ibv_send_wr> = MaybeUninit::uninit();
         let post_send = unsafe {
             (*(*(*self).qp).context)
@@ -196,13 +257,7 @@ impl QueuePair {
                 .expect("Function pointer for post_send missing?")
         };
 
-        let ret = unsafe {
-            post_send(
-                self.qp,
-                &work_request as *const _ as *mut _,
-                bad_wr.as_mut_ptr(),
-            )
-        };
+        let ret = unsafe { post_send(self.qp, &mut requests[0] as *mut _, bad_wr.as_mut_ptr()) };
         // Unlike other rdma and ibverbs functions. The return value must be checked against
         // != 0, not == -1.
         if ret != 0 {
@@ -210,20 +265,37 @@ impl QueuePair {
         }
     }
 
-    pub fn post_receive(&mut self, mr: &mut MemoryRegion, wr_id: u64) {
-        let mr = unsafe { *mr.mr };
-        let sge = ffi::ibv_sge {
-            addr: mr.addr as u64,
-            length: mr.length as u32,
-            lkey: mr.lkey,
-        };
+    pub fn post_receive<'a, I>(&mut self, work_requests: I)
+    where
+        I: Iterator<Item = (u64, &'a RegisteredMemoryRef)> + ExactSizeIterator,
+    {
+        if work_requests.len() == 0 {
+            panic!("memory regions empty! nothing to do4");
+        }
 
-        let work_request = ffi::ibv_recv_wr {
-            wr_id,
-            next: null_mut(),
-            sg_list: &sge as *const _ as *mut _,
-            num_sge: 1,
-        };
+        // Create linked list of memory regions.
+        let work_request_template: ffi::ibv_recv_wr = unsafe { std::mem::zeroed() };
+
+        // Maybe stack allocate to avoid allocation cost?
+        let mut requests: Vec<ffi::ibv_recv_wr> = Vec::with_capacity(work_requests.len());
+        let mut sges: Vec<ffi::ibv_sge> = Vec::with_capacity(work_requests.len());
+
+        // Create all entries to fill `sges` and `requests`
+        for (i, (work_id, memory_ref)) in work_requests.enumerate() {
+            sges.push(ffi::ibv_sge {
+                addr: memory_ref.mem.deref() as *const [u8] as *const u8 as u64,
+                length: memory_ref.mem.len() as u32,
+                lkey: memory_ref.lkey,
+            });
+
+            requests.push(ffi::ibv_recv_wr {
+                wr_id: work_id,
+                sg_list: &mut sges[i] as *mut _,
+                num_sge: 1,
+                ..work_request_template
+            });
+        }
+
         let mut bad_wr: MaybeUninit<*mut ffi::ibv_recv_wr> = MaybeUninit::uninit();
         let post_recv = unsafe {
             (*(*(*self).qp).context)
@@ -232,17 +304,11 @@ impl QueuePair {
                 .expect("Function pointer for post_send missing?")
         };
 
-        let ret = unsafe {
-            post_recv(
-                self.qp,
-                &work_request as *const _ as *mut _,
-                bad_wr.as_mut_ptr(),
-            )
-        };
+        let ret = unsafe { post_recv(self.qp, &mut requests[0] as *mut _, bad_wr.as_mut_ptr()) };
         // Unlike other rdma and ibverbs functions. The return value must be checked against
         // != 0, not == -1.
         if ret != 0 {
-            panic!("Failed to post_send.");
+            panic!("Failed to post_recv.");
         }
     }
 }
@@ -251,7 +317,6 @@ impl QueuePair {
 pub struct CommunicatioManager {
     cm_id: *mut ffi::rdma_cm_id,
 }
-
 
 impl CommunicatioManager {
     fn get_raw_verbs_context(&mut self) -> *mut ffi::ibv_context {
@@ -282,7 +347,7 @@ impl CommunicatioManager {
     // TODO: Currently we require the use to plz not drop this memory. We should be able to use
     // lifetimes/ownership to assert this at compile time.
     #[must_use = "Please refer to the registered memory via the returned `MemoryRegion`"]
-    pub fn register_memory_buffer<T>(&mut self, pd: &ProtectionDomain, memory: &mut Box<[T]>) -> MemoryRegion {
+    pub fn register_memory_buffer<T>(pd: &ProtectionDomain, memory: &mut Box<[T]>) -> MemoryRegion {
         let mr = unsafe {
             ffi::ibv_reg_mr(
                 pd.pd as *const _ as *mut _,
@@ -391,10 +456,19 @@ impl CommunicatioManager {
     }
 
     /// Convert the passed private data into its pointer and length. Returns (null, 0) if None.
-    fn check_private_data<T: 'static>(private_data: Option<&T>) -> (*mut c_void, u8){
-        let ptr = private_data.map(|data| data as *const _ as *mut T as *mut c_void).unwrap_or(null_mut());
-        assert!(std::mem::size_of::<T>() < u8::MAX.into(), "private data too large!");
-        let data_size = if ptr.is_null() { 0 } else { std::mem::size_of::<T>() };
+    fn check_private_data<T: 'static>(private_data: Option<&T>) -> (*mut c_void, u8) {
+        let ptr = private_data
+            .map(|data| data as *const _ as *mut T as *mut c_void)
+            .unwrap_or(null_mut());
+        assert!(
+            std::mem::size_of::<T>() < u8::MAX.into(),
+            "private data too large!"
+        );
+        let data_size = if ptr.is_null() {
+            0
+        } else {
+            std::mem::size_of::<T>()
+        };
         (ptr, data_size as u8)
     }
 
