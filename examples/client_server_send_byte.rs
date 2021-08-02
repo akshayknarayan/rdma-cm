@@ -2,6 +2,7 @@ use nix::sys::socket::IpAddr;
 use nix::sys::socket::{InetAddr, SockAddr};
 use rdma_cm;
 use rdma_cm::{CommunicatioManager, MemoryRegion, RdmaCmEvent, RegisteredMemoryRef};
+use std::net::SocketAddr;
 use std::ops::{Deref, DerefMut};
 use std::ptr::null_mut;
 use std::str::FromStr;
@@ -33,6 +34,10 @@ impl FromStr for Mode {
 struct Opt {
     #[structopt(short, long)]
     mode: Mode,
+    #[structopt(short, long)]
+    loopback_address: String,
+    #[structopt(short, long)]
+    port: u16,
 }
 
 fn main() {
@@ -95,8 +100,10 @@ fn main() {
             println!("Creating channel and device id.");
             let mut cm_connection = CommunicatioManager::new();
 
+            let address = format!("{}:{}", opt.loopback_address, opt.port);
+            let address: SocketAddr = address.parse().expect("Unable to parse socket address");
             println!("Client: Reading address info...");
-            let addr_info = CommunicatioManager::get_addr_info();
+            let addr_info = CommunicatioManager::get_addr_info(InetAddr::from_std(&address));
 
             unsafe {
                 let mut current = addr_info;
@@ -137,7 +144,7 @@ fn main() {
             assert_eq!(RdmaCmEvent::Established, event.get_event());
 
             let mut v = Vec::from([42]).into_boxed_slice();
-            let mut mr = CommunicatioManager::register_memory_buffer(&pd, &mut v);
+            let mr = CommunicatioManager::register_memory_buffer(&pd, &mut v);
             let memory_reference = RegisteredMemoryRef::new(mr.get_lkey(), v);
             println!("pd, cq, and mr allocated!");
 

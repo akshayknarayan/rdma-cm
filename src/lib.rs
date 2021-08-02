@@ -1,13 +1,11 @@
 pub mod ffi;
 
 use nix::errno::Errno;
-use nix::sys::socket::SockAddr;
+use nix::sys::socket::{InetAddr, SockAddr};
 use std::convert::TryFrom;
 use std::ffi::{c_void, CString};
 use std::mem::MaybeUninit;
 
-use std::borrow::{Borrow, BorrowMut};
-use std::cell::RefCell;
 use std::ops::Deref;
 use std::ops::DerefMut;
 use std::ptr::{null, null_mut};
@@ -87,7 +85,7 @@ impl CmEvent {
         // TODO: Add other events here?
         match self.get_event() {
             RdmaCmEvent::ConnectionRequest | RdmaCmEvent::Established => {}
-            other => {
+            _other => {
                 panic!(
                     "get_private_data not supported for {:?} event.",
                     self.get_event()
@@ -296,6 +294,11 @@ impl QueuePair {
             });
         }
 
+        // Link all entries together.
+        for i in 0..requests.len() - 1 {
+            requests[i].next = &mut requests[i + 1] as *mut ffi::ibv_recv_wr;
+        }
+
         let mut bad_wr: MaybeUninit<*mut ffi::ibv_recv_wr> = MaybeUninit::uninit();
         let post_recv = unsafe {
             (*(*(*self).qp).context)
@@ -335,7 +338,7 @@ impl CommunicatioManager {
 
     pub fn create_cq(&mut self) -> CompletionQueue {
         let cq = unsafe {
-            ffi::ibv_create_cq(self.get_raw_verbs_context(), 30, null_mut(), null_mut(), 0)
+            ffi::ibv_create_cq(self.get_raw_verbs_context(), 100, null_mut(), null_mut(), 0)
         };
         if cq == null_mut() {
             panic!("Unable to create_qp");
@@ -390,11 +393,11 @@ impl CommunicatioManager {
             recv_cq: cq.cq,
             srq: null_mut(),
             cap: ffi::ibv_qp_cap {
-                max_send_wr: 30,
-                max_recv_wr: 30,
+                max_send_wr: 256,
+                max_recv_wr: 256,
                 max_send_sge: 10,
                 max_recv_sge: 10,
-                max_inline_data: 10,
+                max_inline_data: 100,
             },
             qp_type: ffi::ibv_qp_type_IBV_QPT_RC,
             sq_sig_all: 0,
@@ -513,10 +516,11 @@ impl CommunicatioManager {
     }
 
     // TODO wrap return value higher level interface. probably iterator!
-    pub fn get_addr_info() -> *mut ffi::rdma_addrinfo {
+    pub fn get_addr_info(inet_addr: InetAddr) -> *mut ffi::rdma_addrinfo {
         // TODO Hardcoded to the address of prometheus10
-        let addr = CString::new("198.19.2.10").unwrap();
-        let port = CString::new("4000").unwrap();
+
+        let addr = CString::new(format!("{}", inet_addr.ip())).unwrap();
+        let port = CString::new(format!("{}", inet_addr.port())).unwrap();
         let mut address_info: MaybeUninit<*mut ffi::rdma_addrinfo> = MaybeUninit::uninit();
 
         let ret = unsafe {
@@ -536,7 +540,7 @@ impl CommunicatioManager {
         unsafe { address_info.assume_init() }
     }
 
-    pub fn resolve_addr(&self, src_addr: Option<SockAddr>, dst_addr: *mut ffi::sockaddr) -> i32 {
+    pub fn resolve_addr(&self, _src_addr: Option<SockAddr>, dst_addr: *mut ffi::sockaddr) -> i32 {
         assert_ne!(dst_addr, null_mut(), "dst_addr is null!");
         unsafe { ffi::rdma_resolve_addr(self.cm_id, null_mut(), dst_addr, 0) }
     }
