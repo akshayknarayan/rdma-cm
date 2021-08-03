@@ -1,14 +1,18 @@
+pub mod error;
 pub mod ffi;
 
-use nix::errno::Errno;
 use nix::sys::socket::{InetAddr, SockAddr};
 use std::convert::TryFrom;
 use std::ffi::{c_void, CString};
 use std::mem::MaybeUninit;
 
-use std::ops::Deref;
-use std::ops::DerefMut;
+use crate::error::RdmaCmError;
+use std::io::Error;
 use std::ptr::{null, null_mut};
+
+use crate::error::Result;
+use std::cmp::max;
+use std::os::raw::c_int;
 
 /// Direct translation of rdma cm event types into an enum. Use the bindgen values to ensure our
 /// events are correctly labeled even if they change in a different header version.
@@ -35,7 +39,7 @@ pub enum RdmaCmEvent {
 #[allow(non_upper_case_globals)]
 impl TryFrom<u32> for RdmaCmEvent {
     type Error = String;
-    fn try_from(n: u32) -> Result<Self, Self::Error> {
+    fn try_from(n: u32) -> std::result::Result<Self, Self::Error> {
         use RdmaCmEvent::*;
 
         let event = match n {
@@ -70,15 +74,16 @@ pub struct CmEvent {
 impl CmEvent {
     pub fn get_event(&self) -> RdmaCmEvent {
         let e = unsafe { (*self.event).event };
+        // If this ever happens, it is a bug.
         TryFrom::try_from(e).expect("Unable to convert event integer to enum.")
     }
 
-    pub fn get_connection_request_id(&self) -> CommunicatioManager {
+    pub fn get_connection_request_id(&self) -> CommunicationManager {
         if self.get_event() != RdmaCmEvent::ConnectionRequest {
             panic!("get_connection_request_id only makes sense for ConnectRequest event!");
         }
         let cm_id = unsafe { (*self.event).id };
-        CommunicatioManager { cm_id }
+        CommunicationManager { cm_id }
     }
 
     pub fn get_private_data<T: 'static + Copy>(&self) -> Option<T> {
@@ -122,51 +127,101 @@ impl CmEvent {
     }
 }
 
-pub struct MemoryRegion {
-    pub mr: *mut ffi::ibv_mr,
+pub struct RegisteredMemory<T: ?Sized> {
+    memory: Box<T>,
+    /// TODO
+    accessed: usize,
+    mr: *mut ffi::ibv_mr,
 }
 
-impl MemoryRegion {
-    pub fn inner(&self) -> ffi::ibv_mr {
+impl<T> RegisteredMemory<[T]> {
+    /// Return total size of memory chunk.
+    pub fn capacity(&self) -> usize {
+        self.memory.len()
+    }
+
+    pub fn accessed(&self) -> usize {
+        self.accessed
+    }
+
+    /// Return a mutable slice to this memory chunk so it may be written to.
+    /// Borrows underlying memory from 0..range.
+    pub fn as_mut_slice(&mut self, range: usize) -> &mut [T] {
+        assert!(range <= self.capacity(), "Accessing out of range memory.");
+
+        self.accessed = max(range, self.accessed);
+        &mut self.memory[..range]
+    }
+
+    pub fn from_buffer(mr: *mut ffi::ibv_mr, memory: Box<[T]>) -> RegisteredMemory<[T]> {
+        RegisteredMemory {
+            memory,
+            mr,
+            accessed: 0,
+        }
+    }
+}
+
+impl<T: ?Sized> RegisteredMemory<T> {
+    fn inner_mr(&self) -> ffi::ibv_mr {
         unsafe { *self.mr }
     }
 
+    // fn get_address(&self) -> () {}
+
     pub fn get_rkey(&self) -> u32 {
-        self.inner().rkey
+        self.inner_mr().rkey
     }
 
     pub fn get_lkey(&self) -> u32 {
-        self.inner().lkey
+        self.inner_mr().lkey
     }
-}
 
-pub struct RegisteredMemoryRef {
-    lkey: u32,
-    mem: Box<[u8]>,
-}
-
-impl RegisteredMemoryRef {
-    pub fn new(lkey: u32, mem: Box<[u8]>) -> RegisteredMemoryRef {
-        RegisteredMemoryRef { lkey, mem }
-    }
-}
-
-impl Deref for RegisteredMemoryRef {
-    type Target = [u8];
-
-    fn deref(&self) -> &Self::Target {
-        self.mem.deref()
-    }
-}
-
-impl DerefMut for RegisteredMemoryRef {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        self.mem.deref_mut()
+    fn new(mr: *mut ffi::ibv_mr, memory: Box<T>) -> RegisteredMemory<T> {
+        RegisteredMemory {
+            memory,
+            mr,
+            accessed: 0,
+        }
     }
 }
 
 pub struct ProtectionDomain {
     pd: *mut ffi::ibv_pd,
+}
+
+impl ProtectionDomain {
+    pub fn register_memory_buffer<T>(&mut self, mut memory: Box<[T]>) -> RegisteredMemory<[T]> {
+        assert!(memory.len() > 0, "No memory allocated for slice.");
+        let mr = unsafe {
+            ffi::ibv_reg_mr(
+                self.pd as *mut _,
+                memory.as_mut_ptr() as *mut _,
+                (memory.len() * std::mem::size_of::<T>()) as u64,
+                ffi::ibv_access_flags_IBV_ACCESS_LOCAL_WRITE as i32,
+            )
+        };
+        if mr == null_mut() {
+            panic!("Unable to register_memory");
+        }
+
+        RegisteredMemory::from_buffer(mr, memory)
+    }
+
+    pub unsafe fn register_memory<T>(&self, mut memory: Box<T>) -> RegisteredMemory<T> {
+        let ptr = memory.as_mut() as *mut T;
+        let mr = ffi::ibv_reg_mr(
+            self.pd as *const _ as *mut _,
+            ptr as *mut c_void,
+            std::mem::size_of::<T>() as u64,
+            ffi::ibv_access_flags_IBV_ACCESS_LOCAL_WRITE as i32,
+        );
+        if mr == null_mut() {
+            panic!("Unable to register_memory");
+        }
+
+        RegisteredMemory::new(mr, memory)
+    }
 }
 
 pub struct CompletionQueue {
@@ -180,7 +235,7 @@ pub struct CompletionQueue {
 
 impl CompletionQueue {
     // TODO this will panic if we poll() while user still has reference to the returned value.
-    // TODO yuck get rid of uncessary box.
+    // TODO yuck get rid of unnecessary box.
     pub fn poll(&self) -> Option<Vec<ffi::ibv_wc>> {
         // zeroed out.
         let mut buffer: [ffi::ibv_wc; 20] = unsafe { std::mem::zeroed() };
@@ -209,9 +264,9 @@ pub struct QueuePair {
 }
 
 impl QueuePair {
-    pub fn post_send<'a, I>(&mut self, work_requests: I)
+    pub fn post_send<'a, I, T: 'static>(&mut self, work_requests: I)
     where
-        I: Iterator<Item = (u64, &'a RegisteredMemoryRef)> + ExactSizeIterator,
+        I: Iterator<Item = (u64, &'a RegisteredMemory<[T]>)> + ExactSizeIterator,
     {
         if work_requests.len() == 0 {
             panic!("memory regions empty! nothing to do4");
@@ -225,11 +280,12 @@ impl QueuePair {
         let mut sges: Vec<ffi::ibv_sge> = Vec::with_capacity(work_requests.len());
 
         // Create all entries to fill `sges` and `requests`
-        for (i, (work_id, memory_ref)) in work_requests.enumerate() {
+        use std::ops::Deref;
+        for (i, (work_id, registered_mem)) in work_requests.enumerate() {
             sges.push(ffi::ibv_sge {
-                addr: memory_ref.mem.deref() as *const [u8] as *const u8 as u64,
-                length: memory_ref.mem.len() as u32,
-                lkey: memory_ref.lkey,
+                addr: registered_mem.memory.deref() as *const [T] as *const u8 as u64,
+                length: (registered_mem.accessed() * std::mem::size_of::<T>()) as u32,
+                lkey: registered_mem.get_lkey(),
             });
 
             requests.push(ffi::ibv_send_wr {
@@ -263,9 +319,9 @@ impl QueuePair {
         }
     }
 
-    pub fn post_receive<'a, I>(&mut self, work_requests: I)
+    pub fn post_receive<'a, I, T: 'static>(&mut self, work_requests: I)
     where
-        I: Iterator<Item = (u64, &'a RegisteredMemoryRef)> + ExactSizeIterator,
+        I: Iterator<Item = (u64, &'a RegisteredMemory<[T]>)> + ExactSizeIterator,
     {
         if work_requests.len() == 0 {
             panic!("memory regions empty! nothing to do4");
@@ -279,11 +335,13 @@ impl QueuePair {
         let mut sges: Vec<ffi::ibv_sge> = Vec::with_capacity(work_requests.len());
 
         // Create all entries to fill `sges` and `requests`
-        for (i, (work_id, memory_ref)) in work_requests.enumerate() {
+        use std::ops::Deref;
+        for (i, (work_id, registered_memory)) in work_requests.enumerate() {
             sges.push(ffi::ibv_sge {
-                addr: memory_ref.mem.deref() as *const [u8] as *const u8 as u64,
-                length: memory_ref.mem.len() as u32,
-                lkey: memory_ref.lkey,
+                addr: registered_memory.memory.deref() as *const [T] as *const u8 as u64,
+                // Receives probably want to use the entire array length.
+                length: (registered_memory.capacity() * std::mem::size_of::<T>()) as u32,
+                lkey: registered_memory.get_lkey(),
             });
 
             requests.push(ffi::ibv_recv_wr {
@@ -317,73 +375,72 @@ impl QueuePair {
 }
 
 /// Uses rdma-cm to manage multiple connections.
-pub struct CommunicatioManager {
+pub struct CommunicationManager {
     cm_id: *mut ffi::rdma_cm_id,
 }
 
-impl CommunicatioManager {
+impl CommunicationManager {
+    pub fn new() -> Result<Self> {
+        let event_channel: *mut ffi::rdma_event_channel =
+            unsafe { ffi::rdma_create_event_channel() };
+        if event_channel == null_mut() {
+            return Err(RdmaCmError::RdmaEventChannel(Error::last_os_error()));
+        }
+
+        let mut id: MaybeUninit<*mut ffi::rdma_cm_id> = MaybeUninit::uninit();
+        let ret = unsafe {
+            ffi::rdma_create_id(
+                event_channel,
+                id.as_mut_ptr(),
+                null_mut(),
+                ffi::rdma_port_space_RDMA_PS_TCP,
+            )
+        };
+        if ret == -1 {
+            return Err(RdmaCmError::RdmaCreateId(Error::last_os_error()));
+        }
+
+        Ok(CommunicationManager {
+            cm_id: unsafe { id.assume_init() },
+        })
+    }
+
+    /// Convenience method for accessing context and checkingn nullness. Used by other methods.
     fn get_raw_verbs_context(&mut self) -> *mut ffi::ibv_context {
+        // Safety: always safe. Our API guarantees dereferencing `cm_id` will always be valid.
         let context = unsafe { (*self.cm_id).verbs };
-        assert_ne!(null_mut(), context, "Context was found to be null!");
+        // This would represent a bug in our implementation.
+        assert_ne!(
+            null_mut(),
+            context,
+            "Missing ibverbs context. It was found to be null!"
+        );
         context
     }
 
-    pub fn allocate_pd(&mut self) -> ProtectionDomain {
+    pub fn allocate_protection_domain(&mut self) -> Result<ProtectionDomain> {
         let pd = unsafe { ffi::ibv_alloc_pd(self.get_raw_verbs_context()) };
         if pd == null_mut() {
-            panic!("allocate_pd failed.");
+            return Err(RdmaCmError::ProtectionDomain);
         }
-        ProtectionDomain { pd }
+        Ok(ProtectionDomain { pd })
     }
 
-    pub fn create_cq(&mut self) -> CompletionQueue {
+    pub fn create_cq(&mut self, entries: c_int) -> Result<CompletionQueue> {
         let cq = unsafe {
-            ffi::ibv_create_cq(self.get_raw_verbs_context(), 100, null_mut(), null_mut(), 0)
+            ffi::ibv_create_cq(
+                self.get_raw_verbs_context(),
+                entries,
+                null_mut(),
+                null_mut(),
+                0,
+            )
         };
         if cq == null_mut() {
-            panic!("Unable to create_qp");
+            return Err(RdmaCmError::CreateCompletionQueue(Error::last_os_error()));
         }
 
-        CompletionQueue { cq }
-    }
-
-    // TODO: Currently we require the use to plz not drop this memory. We should be able to use
-    // lifetimes/ownership to assert this at compile time.
-    #[must_use = "Please refer to the registered memory via the returned `MemoryRegion`"]
-    pub fn register_memory_buffer<T>(pd: &ProtectionDomain, memory: &mut Box<[T]>) -> MemoryRegion {
-        let mr = unsafe {
-            ffi::ibv_reg_mr(
-                pd.pd as *const _ as *mut _,
-                memory.as_mut_ptr() as *mut _,
-                (memory.len() * std::mem::size_of::<T>()) as u64,
-                ffi::ibv_access_flags_IBV_ACCESS_LOCAL_WRITE as i32,
-            )
-        };
-        if mr == null_mut() {
-            panic!("Unable to register_memory");
-        }
-
-        MemoryRegion { mr }
-    }
-
-    // TODO: Currently we require the use to plz not drop this memory. We should be able to use
-    // lifetimes/ownership to assert this at compile time.
-    #[must_use = "Please refer to the registered memory via the returned `MemoryRegion`"]
-    pub unsafe fn register_memory<T>(pd: &ProtectionDomain, memory: &mut Box<T>) -> MemoryRegion {
-        let ptr = memory.as_mut() as *mut T;
-        let mr = unsafe {
-            ffi::ibv_reg_mr(
-                pd.pd as *const _ as *mut _,
-                ptr as *mut c_void,
-                std::mem::size_of::<T>() as u64,
-                ffi::ibv_access_flags_IBV_ACCESS_LOCAL_WRITE as i32,
-            )
-        };
-        if mr == null_mut() {
-            panic!("Unable to register_memory");
-        }
-
-        MemoryRegion { mr }
+        Ok(CompletionQueue { cq })
     }
 
     pub fn create_qp(&self, pd: &ProtectionDomain, cq: &CompletionQueue) -> QueuePair {
@@ -413,33 +470,8 @@ impl CommunicatioManager {
         }
     }
 
-    pub fn new() -> Self {
-        let event_channel: *mut ffi::rdma_event_channel =
-            unsafe { ffi::rdma_create_event_channel() };
-        if event_channel == null_mut() {
-            panic!("rdma_create_event_channel failed!");
-        }
-
-        let mut id: MaybeUninit<*mut ffi::rdma_cm_id> = MaybeUninit::uninit();
-        unsafe {
-            let ret = ffi::rdma_create_id(
-                event_channel,
-                id.as_mut_ptr(),
-                null_mut(),
-                ffi::rdma_port_space_RDMA_PS_TCP,
-            );
-            if ret == -1 {
-                panic!("rdma_create_id failed.")
-            }
-        }
-
-        let id: *mut ffi::rdma_cm_id = unsafe { id.assume_init() };
-        CommunicatioManager { cm_id: id }
-    }
-
-    pub fn connect<T: 'static>(&self, private_data: Option<&T>) {
-        let (ptr, data_size) = CommunicatioManager::check_private_data(private_data);
-        dbg!(ptr, data_size);
+    pub fn connect<T: 'static>(&self, private_data: Option<&T>) -> Result<()> {
+        let (ptr, data_size) = CommunicationManager::check_private_data(private_data);
         let connection_parameters = ffi::rdma_conn_param {
             private_data: ptr,
             private_data_len: data_size,
@@ -451,11 +483,13 @@ impl CommunicatioManager {
             srq: 0,
             qp_num: 0,
         };
+
         let ret =
             unsafe { ffi::rdma_connect(self.cm_id, &connection_parameters as *const _ as *mut _) };
         if ret == -1 {
-            panic!("connect failed");
+            return Err(RdmaCmError::Connect(Error::last_os_error()));
         }
+        Ok(())
     }
 
     /// Convert the passed private data into its pointer and length. Returns (null, 0) if None.
@@ -475,8 +509,8 @@ impl CommunicatioManager {
         (ptr, data_size as u8)
     }
 
-    pub fn accept<T: 'static>(&self, private_data: Option<&T>) {
-        let (ptr, data_size) = CommunicatioManager::check_private_data(private_data);
+    pub fn accept<T: 'static>(&self, private_data: Option<&T>) -> Result<()> {
+        let (ptr, data_size) = CommunicationManager::check_private_data(private_data);
 
         // TODO What are the right values for these parameters?
         let connection_parameters = ffi::rdma_conn_param {
@@ -493,34 +527,35 @@ impl CommunicatioManager {
         let ret =
             unsafe { ffi::rdma_accept(self.cm_id, &connection_parameters as *const _ as *mut _) };
         if ret == -1 {
-            panic!("accept failed");
+            return Err(RdmaCmError::Accept(Error::last_os_error()));
         }
+        Ok(())
     }
 
-    pub fn bind(&self, socket_address: &SockAddr) {
+    pub fn bind(&self, socket_address: &SockAddr) -> Result<()> {
         let (addr, _len) = socket_address.as_ffi_pair();
 
         let ret = unsafe { ffi::rdma_bind_addr(self.cm_id, addr as *const _ as *mut _) };
         if ret == -1 {
-            let errono = Errno::last();
-            panic!("bind failed: {:?}", errono);
+            return Err(RdmaCmError::Bind(Error::last_os_error()));
         }
+        Ok(())
     }
 
-    pub fn listen(&self) {
-        // TODO: Change file descriptor to NON_BLOCKING.
+    pub fn listen(&self) -> Result<()> {
         let ret = unsafe { ffi::rdma_listen(self.cm_id, 100) };
+
         if ret == -1 {
-            panic!("listen failed.")
+            return Err(RdmaCmError::Listen(Error::last_os_error()));
         }
+        Ok(())
     }
 
     // TODO wrap return value higher level interface. probably iterator!
-    pub fn get_addr_info(inet_addr: InetAddr) -> *mut ffi::rdma_addrinfo {
-        // TODO Hardcoded to the address of prometheus10
+    pub fn get_address_info(inet_address: InetAddr) -> Result<*mut ffi::rdma_addrinfo> {
+        let addr = CString::new(format!("{}", inet_address.ip())).unwrap();
+        let port = CString::new(format!("{}", inet_address.port())).unwrap();
 
-        let addr = CString::new(format!("{}", inet_addr.ip())).unwrap();
-        let port = CString::new(format!("{}", inet_addr.port())).unwrap();
         let mut address_info: MaybeUninit<*mut ffi::rdma_addrinfo> = MaybeUninit::uninit();
 
         let ret = unsafe {
@@ -533,11 +568,10 @@ impl CommunicatioManager {
         };
 
         if ret == -1 {
-            let errono = Errno::last();
-            panic!("get_addr_info failed: {:?}", errono);
+            return Err(RdmaCmError::GetAddressInfo(Error::last_os_error()));
         }
 
-        unsafe { address_info.assume_init() }
+        Ok(unsafe { address_info.assume_init() })
     }
 
     pub fn resolve_addr(&self, _src_addr: Option<SockAddr>, dst_addr: *mut ffi::sockaddr) -> i32 {
@@ -545,21 +579,31 @@ impl CommunicatioManager {
         unsafe { ffi::rdma_resolve_addr(self.cm_id, null_mut(), dst_addr, 0) }
     }
 
-    pub fn resolve_route(&self, timeout_ms: i32) {
-        let ret = unsafe { ffi::rdma_resolve_route(self.cm_id, timeout_ms) };
+    pub fn resolve_address(&self, destination_address: *mut ffi::sockaddr) -> Result<()> {
+        assert_ne!(destination_address, null_mut(), "dst_addr is null!");
+        let ret = unsafe { ffi::rdma_resolve_addr(self.cm_id, null_mut(), destination_address, 0) };
         if ret == -1 {
-            let errono = Errno::last();
-            panic!("failed to resolve_route: {:?}", errono);
+            return Err(RdmaCmError::ResolveAddress(Error::last_os_error()));
         }
+        Ok(())
     }
 
-    pub fn get_cm_event(&self) -> CmEvent {
+    pub fn resolve_route(&self, timeout_ms: i32) -> Result<()> {
+        let ret = unsafe { ffi::rdma_resolve_route(self.cm_id, timeout_ms) };
+        if ret == -1 {
+            return Err(RdmaCmError::ResolveRoute(Error::last_os_error()));
+        }
+        Ok(())
+    }
+
+    pub fn get_cm_event(&self) -> Result<CmEvent> {
         let mut cm_events: MaybeUninit<*mut ffi::rdma_cm_event> = MaybeUninit::uninit();
         let ret = unsafe { ffi::rdma_get_cm_event((*self.cm_id).channel, cm_events.as_mut_ptr()) };
         if ret == -1 {
-            panic!("get_cm_event failed!");
+            return Err(RdmaCmError::GetCmEvent(Error::last_os_error()));
         }
-        let cm_events = unsafe { cm_events.assume_init() };
-        CmEvent { event: cm_events }
+        Ok(CmEvent {
+            event: unsafe { cm_events.assume_init() },
+        })
     }
 }
