@@ -96,6 +96,7 @@ impl CmEvent {
         CommunicationManager {
             cm_id,
             event_channel: None,
+            disconnected: false,
         }
     }
 
@@ -137,15 +138,15 @@ impl CmEvent {
     }
 }
 
-pub struct RegisteredMemory<T: ?Sized> {
-    memory: Box<T>,
+pub struct RegisteredMemory<T, const N: usize> {
+    pub memory: Box<[T; N]>,
     /// Amounts of bytes actually accessed. Allows us to only send the bytes actually accessed by
     /// user.
     accessed: usize,
     mr: *mut ffi::ibv_mr,
 }
 
-impl<T: ?Sized> Drop for RegisteredMemory<T> {
+impl<T, const N: usize> Drop for RegisteredMemory<T, N> {
     fn drop(&mut self) {
         let ret = unsafe { ffi::ibv_dereg_mr(self.mr) };
         if ret != 0 {
@@ -155,11 +156,40 @@ impl<T: ?Sized> Drop for RegisteredMemory<T> {
     }
 }
 
-impl<T> RegisteredMemory<[T]> {
+impl<T, const N: usize> RegisteredMemory<T, N> {
+    fn from_array(mr: *mut ffi::ibv_mr, memory: Box<[T; N]>) -> RegisteredMemory<T, N> {
+        RegisteredMemory {
+            memory,
+            mr,
+            accessed: 0,
+        }
+    }
+
+    fn inner_mr(&self) -> ffi::ibv_mr {
+        unsafe { *self.mr }
+    }
+
+    pub fn get_rkey(&self) -> u32 {
+        self.inner_mr().rkey
+    }
+
+    pub fn get_lkey(&self) -> u32 {
+        self.inner_mr().lkey
+    }
+
+    fn new(mr: *mut ffi::ibv_mr, memory: Box<[T; N]>) -> RegisteredMemory<T, N> {
+        RegisteredMemory {
+            memory,
+            mr,
+            accessed: 0,
+        }
+    }
+
     /// "clears" out memory. Useful for when this memory is going to be reused.
     pub fn reset_access(&mut self) {
         self.accessed = 0;
     }
+
     /// Set number of bytes manually since this memory might have been written to by RDMA.
     pub fn initialize_length(&mut self, accessed: usize) {
         assert_eq!(
@@ -189,45 +219,6 @@ impl<T> RegisteredMemory<[T]> {
         self.accessed = max(range, self.accessed);
         &mut self.memory[..range]
     }
-
-    pub fn from_buffer(mr: *mut ffi::ibv_mr, memory: Box<[T]>) -> RegisteredMemory<[T]> {
-        RegisteredMemory {
-            memory,
-            mr,
-            accessed: 0,
-        }
-    }
-
-    pub fn from_array<const N: usize>(
-        mr: *mut ffi::ibv_mr,
-        memory: Box<[T; N]>,
-    ) -> RegisteredMemory<[T; N]> {
-        RegisteredMemory {
-            memory,
-            mr,
-            accessed: 0,
-        }
-    }
-
-    fn inner_mr(&self) -> ffi::ibv_mr {
-        unsafe { *self.mr }
-    }
-
-    pub fn get_rkey(&self) -> u32 {
-        self.inner_mr().rkey
-    }
-
-    pub fn get_lkey(&self) -> u32 {
-        self.inner_mr().lkey
-    }
-
-    fn new(mr: *mut ffi::ibv_mr, memory: Box<T>) -> RegisteredMemory<T> {
-        RegisteredMemory {
-            memory,
-            mr,
-            accessed: 0,
-        }
-    }
 }
 
 pub struct ProtectionDomain {
@@ -248,7 +239,7 @@ impl ProtectionDomain {
     pub fn register_array<T, const N: usize>(
         &mut self,
         mut memory: Box<[T; N]>,
-    ) -> RegisteredMemory<[T; N]> {
+    ) -> RegisteredMemory<T, N> {
         assert!(memory.len() > 0, "No memory allocated for slice.");
         let mr = unsafe {
             ffi::ibv_reg_mr(
@@ -265,22 +256,22 @@ impl ProtectionDomain {
         RegisteredMemory::from_array(mr, memory)
     }
 
-    pub fn register_slice<T>(&mut self, mut memory: Box<[T]>) -> RegisteredMemory<[T]> {
-        assert!(memory.len() > 0, "No memory allocated for slice.");
-        let mr = unsafe {
-            ffi::ibv_reg_mr(
-                self.pd as *mut _,
-                memory.as_mut_ptr() as *mut _,
-                (memory.len() * std::mem::size_of::<T>()) as u64,
-                ffi::ibv_access_flags_IBV_ACCESS_LOCAL_WRITE as i32,
-            )
-        };
-        if mr == null_mut() {
-            panic!("Unable to register_memory");
-        }
-
-        RegisteredMemory::from_buffer(mr, memory)
-    }
+    // pub fn register_slice<T>(&mut self, mut memory: Box<[T]>) -> RegisteredMemory<[T]> {
+    //     assert!(memory.len() > 0, "No memory allocated for slice.");
+    //     let mr = unsafe {
+    //         ffi::ibv_reg_mr(
+    //             self.pd as *mut _,
+    //             memory.as_mut_ptr() as *mut _,
+    //             (memory.len() * std::mem::size_of::<T>()) as u64,
+    //             ffi::ibv_access_flags_IBV_ACCESS_LOCAL_WRITE as i32,
+    //         )
+    //     };
+    //     if mr == null_mut() {
+    //         panic!("Unable to register_memory");
+    //     }
+    //
+    //     RegisteredMemory::from_buffer(mr, memory)
+    // }
 }
 
 pub struct CompletionQueue {
@@ -338,9 +329,9 @@ impl Drop for QueuePair {
 }
 
 impl QueuePair {
-    pub fn post_send<'a, I, T: 'static>(&mut self, work_requests: I)
+    pub fn post_send<'a, I, T: 'static, const N: usize>(&mut self, work_requests: I)
     where
-        I: Iterator<Item = (u64, &'a RegisteredMemory<[T]>)> + ExactSizeIterator,
+        I: Iterator<Item = (u64, &'a RegisteredMemory<T, N>)> + ExactSizeIterator,
     {
         if work_requests.len() == 0 {
             panic!("memory regions empty! nothing to do4");
@@ -393,9 +384,9 @@ impl QueuePair {
         }
     }
 
-    pub fn post_receive<'a, I, T: 'static>(&mut self, work_requests: I)
+    pub fn post_receive<'a, I, T: 'static, const N: usize>(&mut self, work_requests: I)
     where
-        I: Iterator<Item = (u64, &'a RegisteredMemory<[T]>)> + ExactSizeIterator,
+        I: Iterator<Item = (u64, &'a RegisteredMemory<T, N>)> + ExactSizeIterator,
     {
         if work_requests.len() == 0 {
             panic!("memory regions empty! nothing to do4");
@@ -454,6 +445,8 @@ pub struct CommunicationManager {
     /// If the CommunicationManager is used for connecting two nodes it needs an event channel.
     /// We keep a reference to it for deallocation.
     event_channel: Option<*mut ffi::rdma_event_channel>,
+    /// Whether user explicitly called disconnect or not?
+    disconnected: bool,
 }
 
 impl Drop for CommunicationManager {
@@ -464,6 +457,8 @@ impl Drop for CommunicationManager {
             println!("Unable to rdma_destroy_id: {}", error);
         }
 
+        // Not all ids have an event channel. Only the listening id for the initial pairing between
+        // queue pairs do.
         // This call should return a status int but it doesn't... Nothing we can do...
         if let Some(event_channel) = self.event_channel {
             unsafe { ffi::rdma_destroy_event_channel(event_channel) };
@@ -495,6 +490,7 @@ impl CommunicationManager {
         Ok(CommunicationManager {
             cm_id: unsafe { id.assume_init() },
             event_channel: Some(event_channel),
+            disconnected: false,
         })
     }
 
@@ -693,5 +689,15 @@ impl CommunicationManager {
         Ok(CmEvent {
             event: unsafe { cm_events.assume_init() },
         })
+    }
+
+    pub fn disconnect(&mut self) -> Result<()> {
+        let ret = unsafe { ffi::rdma_disconnect(self.cm_id) };
+        if ret == -1 {
+            return Err(RdmaCmError::Disconnect(Error::last_os_error()));
+        }
+
+        self.disconnected = true;
+        Ok(())
     }
 }
