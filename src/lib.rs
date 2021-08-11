@@ -289,8 +289,6 @@ impl Drop for CompletionQueue {
 }
 
 impl CompletionQueue {
-    // TODO this will panic if we poll() while user still has reference to the returned value.
-    // TODO yuck get rid of unnecessary box.
     pub fn poll(&self) -> Option<Vec<ffi::ibv_wc>> {
         // zeroed out.
         let mut buffer: [ffi::ibv_wc; 20] = unsafe { std::mem::zeroed() };
@@ -329,112 +327,183 @@ impl Drop for QueuePair {
 }
 
 impl QueuePair {
-    pub fn post_send<'a, I, T: 'static, const N: usize>(&mut self, work_requests: I)
+    pub fn post_send<'a, I, T, const N: usize>(&mut self, work_requests: I)
     where
         I: Iterator<Item = (u64, &'a RegisteredMemory<T, N>)> + ExactSizeIterator,
+        T: 'static + Copy,
     {
+        self.post_request::<PostSend, I, T, N>(work_requests)
+    }
+
+    pub fn post_receive<'a, I, T, const N: usize>(&mut self, work_requests: I)
+    where
+        I: Iterator<Item = (u64, &'a RegisteredMemory<T, N>)> + ExactSizeIterator,
+        T: 'static + Copy,
+    {
+        self.post_request::<PostRecv, I, T, N>(work_requests)
+    }
+
+    fn post_request<'a, R, I, T, const N: usize>(&mut self, work_requests: I)
+    where
+        I: Iterator<Item = (u64, &'a RegisteredMemory<T, N>)> + ExactSizeIterator,
+        // Copy because we only want user sending "dumb" data.
+        T: 'static + Copy,
+        R: Request,
+    {
+        use std::ops::Deref;
+
         if work_requests.len() == 0 {
-            panic!("memory regions empty! nothing to do4");
+            panic!("memory regions empty! nothing to do.");
         }
 
-        // Create linked list of memory regions.
-        let work_request_template: ffi::ibv_send_wr = unsafe { std::mem::zeroed() };
-
         // Maybe stack allocate to avoid allocation cost?
-        let mut requests: Vec<ffi::ibv_send_wr> = Vec::with_capacity(work_requests.len());
+        let mut requests: Vec<R::WorkRequest> = Vec::with_capacity(work_requests.len());
         let mut sges: Vec<ffi::ibv_sge> = Vec::with_capacity(work_requests.len());
 
         // Create all entries to fill `sges` and `requests`
-        use std::ops::Deref;
-        for (i, (work_id, registered_mem)) in work_requests.enumerate() {
+        for (i, (work_id, memory)) in work_requests.enumerate() {
+            // Total number of bytes to send.
+            let length = (R::memory_size(memory) * std::mem::size_of::<T>()) as u32;
+
             sges.push(ffi::ibv_sge {
-                addr: registered_mem.memory.deref() as *const [T] as *const u8 as u64,
-                length: (registered_mem.accessed() * std::mem::size_of::<T>()) as u32,
-                lkey: registered_mem.get_lkey(),
+                addr: memory.memory.deref() as *const [T] as *const u8 as u64,
+                length,
+                lkey: memory.get_lkey(),
             });
 
-            requests.push(ffi::ibv_send_wr {
-                wr_id: work_id,
-                sg_list: &mut sges[i] as *mut _,
-                num_sge: 1,
-                opcode: ffi::ibv_wr_opcode_IBV_WR_SEND,
-                send_flags: ffi::ibv_send_flags_IBV_SEND_SIGNALED,
-                ..work_request_template
-            });
+            let wr = R::make_work_request(work_id, &mut sges[i] as *mut _, length <= 512);
+            requests.push(wr);
         }
 
         // Link all entries together.
-        for i in 0..requests.len() - 1 {
-            requests[i].next = &mut requests[i + 1] as *mut ffi::ibv_send_wr;
-        }
+        R::link(&mut requests);
 
-        let mut bad_wr: MaybeUninit<*mut ffi::ibv_send_wr> = MaybeUninit::uninit();
-        let post_send = unsafe {
-            (*(*(*self).qp).context)
+        let mut bad_wr: MaybeUninit<*mut R::WorkRequest> = MaybeUninit::uninit();
+        let request = R::post(self);
+        let ret = unsafe { request(self.qp, &mut requests[0] as *mut _, bad_wr.as_mut_ptr()) };
+        // Unlike other rdma and ibverbs functions. The return value must be checked against
+        // != 0, not == -1.
+        if ret != 0 {
+            let error = Error::last_os_error();
+            panic!("Failed to post request: {}", error);
+        }
+    }
+}
+
+trait Request {
+    type WorkRequest;
+    fn post(
+        qp: &mut QueuePair,
+    ) -> unsafe extern "C" fn(
+        *mut ffi::ibv_qp,
+        *mut Self::WorkRequest,
+        *mut *mut Self::WorkRequest,
+    ) -> i32;
+
+    fn memory_size<T, const N: usize>(memory: &RegisteredMemory<T, N>) -> usize;
+
+    fn make_work_request(wr_id: u64, sg_list: *mut ffi::ibv_sge, inline: bool)
+        -> Self::WorkRequest;
+
+    fn link(requests: &mut Vec<Self::WorkRequest>);
+}
+
+enum PostSend {}
+
+impl Request for PostSend {
+    type WorkRequest = ffi::ibv_send_wr;
+
+    fn post(
+        qp: &mut QueuePair,
+    ) -> unsafe extern "C" fn(
+        *mut ffi::ibv_qp,
+        *mut Self::WorkRequest,
+        *mut *mut Self::WorkRequest,
+    ) -> i32 {
+        unsafe {
+            (*(*(*qp).qp).context)
                 .ops
                 .post_send
                 .expect("Function pointer for post_send missing?")
-        };
-
-        let ret = unsafe { post_send(self.qp, &mut requests[0] as *mut _, bad_wr.as_mut_ptr()) };
-        // Unlike other rdma and ibverbs functions. The return value must be checked against
-        // != 0, not == -1.
-        if ret != 0 {
-            panic!("Failed to post_send.");
         }
     }
 
-    pub fn post_receive<'a, I, T: 'static, const N: usize>(&mut self, work_requests: I)
-    where
-        I: Iterator<Item = (u64, &'a RegisteredMemory<T, N>)> + ExactSizeIterator,
-    {
-        if work_requests.len() == 0 {
-            panic!("memory regions empty! nothing to do4");
-        }
+    /// Only register the memory that has been written to with the device.
+    fn memory_size<T, const N: usize>(memory: &RegisteredMemory<T, N>) -> usize {
+        memory.accessed()
+    }
 
-        // Create linked list of memory regions.
-        let work_request_template: ffi::ibv_recv_wr = unsafe { std::mem::zeroed() };
-
-        // Maybe stack allocate to avoid allocation cost?
-        let mut requests: Vec<ffi::ibv_recv_wr> = Vec::with_capacity(work_requests.len());
-        let mut sges: Vec<ffi::ibv_sge> = Vec::with_capacity(work_requests.len());
-
-        // Create all entries to fill `sges` and `requests`
-        use std::ops::Deref;
-        for (i, (work_id, registered_memory)) in work_requests.enumerate() {
-            sges.push(ffi::ibv_sge {
-                addr: registered_memory.memory.deref() as *const [T] as *const u8 as u64,
-                // Receives probably want to use the entire array length.
-                length: (registered_memory.capacity() * std::mem::size_of::<T>()) as u32,
-                lkey: registered_memory.get_lkey(),
-            });
-
-            requests.push(ffi::ibv_recv_wr {
-                wr_id: work_id,
-                sg_list: &mut sges[i] as *mut _,
-                num_sge: 1,
-                ..work_request_template
-            });
-        }
-
-        // Link all entries together.
-        for i in 0..requests.len() - 1 {
-            requests[i].next = &mut requests[i + 1] as *mut ffi::ibv_recv_wr;
-        }
-
-        let mut bad_wr: MaybeUninit<*mut ffi::ibv_recv_wr> = MaybeUninit::uninit();
-        let post_recv = unsafe {
-            (*(*(*self).qp).context)
-                .ops
-                .post_recv
-                .expect("Function pointer for post_send missing?")
+    fn make_work_request(
+        wr_id: u64,
+        sg_list: *mut ffi::ibv_sge,
+        inline: bool,
+    ) -> Self::WorkRequest {
+        let work_request_template: Self::WorkRequest = unsafe { std::mem::zeroed() };
+        let inline = if inline {
+            ffi::ibv_send_flags_IBV_SEND_INLINE
+        } else {
+            0
         };
 
-        let ret = unsafe { post_recv(self.qp, &mut requests[0] as *mut _, bad_wr.as_mut_ptr()) };
-        // Unlike other rdma and ibverbs functions. The return value must be checked against
-        // != 0, not == -1.
-        if ret != 0 {
-            panic!("Failed to post_recv.");
+        Self::WorkRequest {
+            wr_id,
+            sg_list,
+            num_sge: 1,
+            opcode: ffi::ibv_wr_opcode_IBV_WR_SEND,
+            send_flags: ffi::ibv_send_flags_IBV_SEND_SIGNALED | inline,
+            ..work_request_template
+        }
+    }
+
+    fn link(requests: &mut Vec<Self::WorkRequest>) {
+        for i in 0..requests.len() - 1 {
+            requests[i].next = &mut requests[i + 1] as *mut ffi::ibv_send_wr;
+        }
+    }
+}
+
+enum PostRecv {}
+
+impl Request for PostRecv {
+    type WorkRequest = ffi::ibv_recv_wr;
+
+    fn post(
+        qp: &mut QueuePair,
+    ) -> unsafe extern "C" fn(
+        *mut ffi::ibv_qp,
+        *mut Self::WorkRequest,
+        *mut *mut Self::WorkRequest,
+    ) -> i32 {
+        unsafe {
+            (*(*(*qp).qp).context)
+                .ops
+                .post_recv
+                .expect("Function pointer for post_recv missing?")
+        }
+    }
+
+    /// Register the whole memory size with the device.
+    fn memory_size<T, const N: usize>(memory: &RegisteredMemory<T, N>) -> usize {
+        memory.capacity()
+    }
+
+    // Post recvs do not care about inline data.
+    fn make_work_request(
+        wr_id: u64,
+        sg_list: *mut ffi::ibv_sge,
+        _inline: bool,
+    ) -> Self::WorkRequest {
+        Self::WorkRequest {
+            wr_id,
+            next: null_mut(),
+            sg_list,
+            num_sge: 1,
+        }
+    }
+
+    fn link(requests: &mut Vec<Self::WorkRequest>) {
+        for i in 0..requests.len() - 1 {
+            requests[i].next = &mut requests[i + 1] as *mut Self::WorkRequest;
         }
     }
 }
@@ -543,7 +612,7 @@ impl CommunicationManager {
                 max_recv_wr: 256,
                 max_send_sge: 10,
                 max_recv_sge: 10,
-                max_inline_data: 100,
+                max_inline_data: 512,
             },
             qp_type: ffi::ibv_qp_type_IBV_QPT_RC,
             sq_sig_all: 0,
