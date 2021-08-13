@@ -351,7 +351,7 @@ pub struct QueuePair {
 impl QueuePair {
     pub fn post_send<'a, I, T, const N: usize>(&mut self, work_requests: I)
     where
-        I: Iterator<Item = (u64, &'a RegisteredMemory<T, N>)> + ExactSizeIterator,
+        I: Iterator<Item = &'a (u64, RegisteredMemory<T, N>)> + ExactSizeIterator,
         T: 'static + Copy,
     {
         self.post_request::<PostSend, I, T, N, 1>(work_requests)
@@ -359,7 +359,7 @@ impl QueuePair {
 
     pub fn post_receive<'a, I, T, const N: usize>(&mut self, work_requests: I)
     where
-        I: Iterator<Item = (u64, &'a RegisteredMemory<T, N>)> + ExactSizeIterator,
+        I: Iterator<Item = &'a (u64, RegisteredMemory<T, N>)> + ExactSizeIterator,
         T: 'static + Copy,
     {
         self.post_request::<PostRecv, I, T, N, 256>(work_requests)
@@ -369,7 +369,7 @@ impl QueuePair {
         &mut self,
         work_requests: I,
     ) where
-        I: Iterator<Item = (u64, &'a RegisteredMemory<T, N>)> + ExactSizeIterator,
+        I: Iterator<Item = &'a (u64, RegisteredMemory<T, N>)> + ExactSizeIterator,
         // Copy because we only want user sending "dumb" data.
         T: 'static + Copy,
         R: Request,
@@ -401,7 +401,7 @@ impl QueuePair {
                 });
             }
 
-            let wr = R::make_work_request(work_id, &mut sges[i] as *mut _, length <= 512);
+            let wr = R::make_work_request(*work_id, &mut sges[i] as *mut _, length <= 512);
             unsafe {
                 requests.push_unchecked(wr);
             }
