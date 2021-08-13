@@ -8,10 +8,15 @@ use std::mem::MaybeUninit;
 
 use crate::error::RdmaCmError;
 use crate::error::Result;
+use arrayvec::ArrayVec;
 use std::cmp::max;
 use std::io::Error;
-use std::os::raw::c_int;
 use std::ptr::{null, null_mut};
+
+use std::rc::Rc;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::Arc;
+use tracing::trace;
 
 /// Direct translation of rdma cm event types into an enum. Use the bindgen values to ensure our
 /// events are correctly labeled even if they change in a different header version.
@@ -177,14 +182,6 @@ impl<T, const N: usize> RegisteredMemory<T, N> {
         self.inner_mr().lkey
     }
 
-    fn new(mr: *mut ffi::ibv_mr, memory: Box<[T; N]>) -> RegisteredMemory<T, N> {
-        RegisteredMemory {
-            memory,
-            mr,
-            accessed: 0,
-        }
-    }
-
     /// "clears" out memory. Useful for when this memory is going to be reused.
     pub fn reset_access(&mut self) {
         self.accessed = 0;
@@ -256,29 +253,44 @@ impl ProtectionDomain {
         RegisteredMemory::from_array(mr, memory)
     }
 
-    // pub fn register_slice<T>(&mut self, mut memory: Box<[T]>) -> RegisteredMemory<[T]> {
-    //     assert!(memory.len() > 0, "No memory allocated for slice.");
-    //     let mr = unsafe {
-    //         ffi::ibv_reg_mr(
-    //             self.pd as *mut _,
-    //             memory.as_mut_ptr() as *mut _,
-    //             (memory.len() * std::mem::size_of::<T>()) as u64,
-    //             ffi::ibv_access_flags_IBV_ACCESS_LOCAL_WRITE as i32,
-    //         )
-    //     };
-    //     if mr == null_mut() {
-    //         panic!("Unable to register_memory");
-    //     }
-    //
-    //     RegisteredMemory::from_buffer(mr, memory)
-    // }
+    pub fn register_chunk<const SIZE: usize>(
+        &mut self,
+        number_of_chunks: usize,
+    ) -> Vec<RegisteredMemory<u8, SIZE>> {
+        let mut memory: Box<[u8]> = vec![0 as u8; number_of_chunks * SIZE].into_boxed_slice();
+
+        let mr = unsafe {
+            ffi::ibv_reg_mr(
+                self.pd as *mut _,
+                memory.as_mut_ptr() as *mut _,
+                memory.len() as u64,
+                ffi::ibv_access_flags_IBV_ACCESS_LOCAL_WRITE as i32,
+            )
+        };
+        if mr == null_mut() {
+            panic!("Unable to register_memory");
+        }
+        let ptr = Box::into_raw(memory) as *mut u8;
+
+        let mut chunks = Vec::with_capacity(SIZE);
+        let mut current = ptr;
+        for i in 0..number_of_chunks {
+            unsafe {
+                let chunk = Box::from_raw(current as *mut [u8; SIZE]);
+                chunks.push(RegisteredMemory::from_array(mr, chunk));
+                current.add(SIZE);
+            }
+        }
+
+        chunks
+    }
 }
 
-pub struct CompletionQueue {
+pub struct CompletionQueue<const POLL_ELEMENTS: usize> {
     cq: *mut ffi::ibv_cq,
 }
 
-impl Drop for CompletionQueue {
+impl<const POLL_ELEMENTS: usize> Drop for CompletionQueue<POLL_ELEMENTS> {
     fn drop(&mut self) {
         let ret = unsafe { ffi::ibv_destroy_cq(self.cq) };
         if ret != 0 {
@@ -288,42 +300,52 @@ impl Drop for CompletionQueue {
     }
 }
 
-impl CompletionQueue {
-    pub fn poll(&self) -> Option<Vec<ffi::ibv_wc>> {
-        // zeroed out.
-        let mut buffer: [ffi::ibv_wc; 20] = unsafe { std::mem::zeroed() };
+impl<const POLL_ELEMENTS: usize> CompletionQueue<POLL_ELEMENTS> {
+    pub fn poll(&self) -> Option<arrayvec::IntoIter<ffi::ibv_wc, POLL_ELEMENTS>> {
+        let mut entries: ArrayVec<ffi::ibv_wc, POLL_ELEMENTS> = ArrayVec::new_const();
 
         let poll_cq = unsafe {
             (*(*self.cq).context)
                 .ops
                 .poll_cq
-                .expect("Function pointer for post_send missing?")
+                .expect("Function pointer for poll_cq missing?")
         };
 
-        let ret = unsafe { poll_cq(self.cq, buffer.len() as i32, buffer.as_mut_ptr()) };
+        let ret = unsafe { poll_cq(self.cq, entries.capacity() as i32, entries.as_mut_ptr()) };
         if ret < 0 {
             panic!("polling cq failed.");
         }
+        // Initialize the length based on how much poll_cq filled.
+        // trace!("Polled entries found: {}", ret);
         if ret == 0 {
-            return None;
+            None
         } else {
-            Some(buffer[0..ret as usize].to_vec())
+            unsafe {
+                entries.set_len(ret as usize);
+            }
+            Some(entries.into_iter())
         }
     }
 }
 
-pub struct QueuePair {
-    qp: *mut ffi::ibv_qp,
-}
+/// Wrapper struct for new type pattern so we implement Drop for ffi::ibv_qp.
+#[derive(Clone)]
+struct ibv_qp(*mut ffi::ibv_qp);
 
-impl Drop for QueuePair {
+impl Drop for ibv_qp {
     fn drop(&mut self) {
-        let ret = unsafe { ffi::ibv_destroy_qp(self.qp) };
+        let ret = unsafe { ffi::ibv_destroy_qp(self.0) };
         if ret != 0 {
             let error = Error::last_os_error();
-            println!("Unable to ibv_destroy_qp: {}.", error);
+            eprintln!("Unable to ibv_destroy_qp: {}.", error);
         }
     }
+}
+
+/// Allow QueuePair to be Cloned. This is totally safe.
+#[derive(Clone)]
+pub struct QueuePair {
+    qp: Rc<ibv_qp>,
 }
 
 impl QueuePair {
@@ -332,7 +354,7 @@ impl QueuePair {
         I: Iterator<Item = (u64, &'a RegisteredMemory<T, N>)> + ExactSizeIterator,
         T: 'static + Copy,
     {
-        self.post_request::<PostSend, I, T, N>(work_requests)
+        self.post_request::<PostSend, I, T, N, 1>(work_requests)
     }
 
     pub fn post_receive<'a, I, T, const N: usize>(&mut self, work_requests: I)
@@ -340,39 +362,49 @@ impl QueuePair {
         I: Iterator<Item = (u64, &'a RegisteredMemory<T, N>)> + ExactSizeIterator,
         T: 'static + Copy,
     {
-        self.post_request::<PostRecv, I, T, N>(work_requests)
+        self.post_request::<PostRecv, I, T, N, 256>(work_requests)
     }
 
-    fn post_request<'a, R, I, T, const N: usize>(&mut self, work_requests: I)
-    where
+    fn post_request<'a, R, I, T, const N: usize, const MAX_REQUEST_SIZE: usize>(
+        &mut self,
+        work_requests: I,
+    ) where
         I: Iterator<Item = (u64, &'a RegisteredMemory<T, N>)> + ExactSizeIterator,
         // Copy because we only want user sending "dumb" data.
         T: 'static + Copy,
         R: Request,
     {
         use std::ops::Deref;
+        assert_ne!(
+            work_requests.len(),
+            0,
+            "memory regions empty! nothing to do."
+        );
+        assert!(
+            work_requests.len() <= MAX_REQUEST_SIZE,
+            "Too many requests. Max size reached"
+        );
 
-        if work_requests.len() == 0 {
-            panic!("memory regions empty! nothing to do.");
-        }
-
-        // Maybe stack allocate to avoid allocation cost?
-        let mut requests: Vec<R::WorkRequest> = Vec::with_capacity(work_requests.len());
-        let mut sges: Vec<ffi::ibv_sge> = Vec::with_capacity(work_requests.len());
+        let mut requests: ArrayVec<R::WorkRequest, MAX_REQUEST_SIZE> = ArrayVec::new_const();
+        let mut sges: ArrayVec<ffi::ibv_sge, MAX_REQUEST_SIZE> = ArrayVec::new_const();
 
         // Create all entries to fill `sges` and `requests`
         for (i, (work_id, memory)) in work_requests.enumerate() {
             // Total number of bytes to send.
             let length = (R::memory_size(memory) * std::mem::size_of::<T>()) as u32;
 
-            sges.push(ffi::ibv_sge {
-                addr: memory.memory.deref() as *const [T] as *const u8 as u64,
-                length,
-                lkey: memory.get_lkey(),
-            });
+            unsafe {
+                sges.push_unchecked(ffi::ibv_sge {
+                    addr: memory.memory.deref() as *const [T] as *const u8 as u64,
+                    length,
+                    lkey: memory.get_lkey(),
+                });
+            }
 
             let wr = R::make_work_request(work_id, &mut sges[i] as *mut _, length <= 512);
-            requests.push(wr);
+            unsafe {
+                requests.push_unchecked(wr);
+            }
         }
 
         // Link all entries together.
@@ -380,7 +412,8 @@ impl QueuePair {
 
         let mut bad_wr: MaybeUninit<*mut R::WorkRequest> = MaybeUninit::uninit();
         let request = R::post(self);
-        let ret = unsafe { request(self.qp, &mut requests[0] as *mut _, bad_wr.as_mut_ptr()) };
+
+        let ret = unsafe { request(self.qp.0, requests.as_mut_ptr(), bad_wr.as_mut_ptr()) };
         // Unlike other rdma and ibverbs functions. The return value must be checked against
         // != 0, not == -1.
         if ret != 0 {
@@ -405,7 +438,7 @@ trait Request {
     fn make_work_request(wr_id: u64, sg_list: *mut ffi::ibv_sge, inline: bool)
         -> Self::WorkRequest;
 
-    fn link(requests: &mut Vec<Self::WorkRequest>);
+    fn link<const N: usize>(requests: &mut ArrayVec<Self::WorkRequest, N>);
 }
 
 enum PostSend {}
@@ -421,7 +454,7 @@ impl Request for PostSend {
         *mut *mut Self::WorkRequest,
     ) -> i32 {
         unsafe {
-            (*(*(*qp).qp).context)
+            (*(*(*qp).qp.0).context)
                 .ops
                 .post_send
                 .expect("Function pointer for post_send missing?")
@@ -455,7 +488,7 @@ impl Request for PostSend {
         }
     }
 
-    fn link(requests: &mut Vec<Self::WorkRequest>) {
+    fn link<const N: usize>(requests: &mut ArrayVec<Self::WorkRequest, N>) {
         for i in 0..requests.len() - 1 {
             requests[i].next = &mut requests[i + 1] as *mut ffi::ibv_send_wr;
         }
@@ -475,7 +508,7 @@ impl Request for PostRecv {
         *mut *mut Self::WorkRequest,
     ) -> i32 {
         unsafe {
-            (*(*(*qp).qp).context)
+            (*(*(*qp).qp.0).context)
                 .ops
                 .post_recv
                 .expect("Function pointer for post_recv missing?")
@@ -501,7 +534,7 @@ impl Request for PostRecv {
         }
     }
 
-    fn link(requests: &mut Vec<Self::WorkRequest>) {
+    fn link<const N: usize>(requests: &mut ArrayVec<Self::WorkRequest, N>) {
         for i in 0..requests.len() - 1 {
             requests[i].next = &mut requests[i + 1] as *mut Self::WorkRequest;
         }
@@ -584,11 +617,11 @@ impl CommunicationManager {
         Ok(ProtectionDomain { pd })
     }
 
-    pub fn create_cq(&self, entries: c_int) -> Result<CompletionQueue> {
+    pub fn create_cq<const ELEMENTS: usize>(&self) -> Result<CompletionQueue<ELEMENTS>> {
         let cq = unsafe {
             ffi::ibv_create_cq(
                 self.get_raw_verbs_context(),
-                entries,
+                ELEMENTS as i32,
                 null_mut(),
                 null_mut(),
                 0,
@@ -601,7 +634,11 @@ impl CommunicationManager {
         Ok(CompletionQueue { cq })
     }
 
-    pub fn create_qp(&self, pd: &ProtectionDomain, cq: &CompletionQueue) -> QueuePair {
+    pub fn create_qp<const ELEMENTS: usize>(
+        &self,
+        pd: &ProtectionDomain,
+        cq: &CompletionQueue<ELEMENTS>,
+    ) -> QueuePair {
         let qp_init_attr: ffi::ibv_qp_init_attr = ffi::ibv_qp_init_attr {
             qp_context: null_mut(),
             send_cq: cq.cq,
@@ -624,7 +661,7 @@ impl CommunicationManager {
         }
 
         QueuePair {
-            qp: unsafe { (*self.cm_id).qp },
+            qp: unsafe { Rc::new(ibv_qp((*self.cm_id).qp)) },
         }
     }
 

@@ -64,7 +64,7 @@ fn main() -> Result<(), RdmaCmError> {
             println!("Acked ConnectionRequest.");
 
             let mut pd = connected_id.allocate_protection_domain()?;
-            let cq = connected_id.create_cq(100)?;
+            let cq = connected_id.create_cq::<100>()?;
             let mut qp = connected_id.create_qp(&pd, &cq);
 
             println!("Server: Accepting client connection.");
@@ -149,7 +149,7 @@ fn main() -> Result<(), RdmaCmError> {
 
             println!("Creating queue pairs.");
             let mut pd = cm_connection.allocate_protection_domain()?;
-            let cq = cm_connection.create_cq(10)?;
+            let cq = cm_connection.create_cq::<100>()?;
             let mut qp = cm_connection.create_qp(&pd, &cq);
 
             println!("Client: Connecting.");
@@ -169,16 +169,13 @@ fn main() -> Result<(), RdmaCmError> {
 
             let mut done = false;
             while !done {
-                match cq.poll() {
-                    None => {}
-                    Some(entries) => {
-                        for e in entries {
-                            assert_eq!(1, e.wr_id, "Incorrect work request id.");
-                            assert_eq!(e.status, 0, "Other completion status found.");
-                            println!("Client's value sent!");
-                            done = true;
-                            break;
-                        }
+                if let Some(entries) = cq.poll() {
+                    for e in entries {
+                        assert_eq!(1, e.wr_id, "Incorrect work request id.");
+                        assert_eq!(e.status, 0, "Other completion status found.");
+                        println!("Client's value sent!");
+                        done = true;
+                        break;
                     }
                 }
             }
