@@ -27,6 +27,14 @@ enum Mode {
     },
 }
 
+/// Connection data transmitted through the private data struct fields by our `connect` and `accept`
+/// function to set up one-sided RDMA. (u64, u32) are (address of volatile_send_window, rkey).
+#[derive(Clone, Copy, Debug)]
+pub struct PeerConnectionData {
+    remote_address: *mut u64,
+    rkey: u32,
+}
+
 fn main() -> Result<(), RdmaCmError> {
     match Mode::from_args() {
         Mode::Server { port } => {
@@ -44,19 +52,23 @@ fn main() -> Result<(), RdmaCmError> {
             listening_id.listen()?;
 
             let event = listening_id.get_cm_event()?;
+
             assert_eq!(RdmaCmEvent::ConnectionRequest, event.get_event());
             println!("Server: listened return with event!");
             let mut connected_id = event.get_connection_request_id();
+
+            let peer: PeerConnectionData = event.get_private_data().expect("Private data missing!");
+            dbg!(peer);
             event.ack();
             println!("Acked ConnectionRequest.");
 
             let mut pd = connected_id.allocate_protection_domain()?;
             let cq = connected_id.create_cq::<100>()?;
             let mut qp = connected_id.create_qp(&pd, &cq);
+            println!("pd, cq, and mr allocated!");
 
-            println!("Server: Accepting client connection.");
             connected_id.accept()?;
-
+            println!("Server: Accepting client connection.");
             let event = listening_id.get_cm_event()?;
             assert_eq!(RdmaCmEvent::Established, event.get_event());
             event.ack();
@@ -64,18 +76,21 @@ fn main() -> Result<(), RdmaCmError> {
 
             let mut memory: RegisteredMemory<u64, 1> = pd.allocate_memory::<u64, 1>();
             memory.as_mut_slice(1)[0] = 42;
+            let work = vec![(1, memory)];
 
-            println!("pd, cq, and mr allocated!");
-            let mut work = vec![(2, memory)];
+            let rdma_write = PostSendOpcode::WrRdmaWrite {
+                rkey: peer.rkey,
+                remote_address: peer.remote_address,
+            };
 
-            qp.post_receive(work.iter());
+            qp.post_send(work.iter(), rdma_write);
+
             let mut done: bool = false;
             while !done {
                 if let Some(entries) = cq.poll() {
                     for e in entries {
-                        assert_eq!(2, e.wr_id, "Incorrect work request id.");
+                        assert_eq!(1, e.wr_id, "Incorrect work request id.");
                         assert_eq!(e.status, 0, "Other completion status found.");
-                        println!("{:?}", work[0].1.as_mut_slice(1));
                         done = true;
                         break;
                     }
@@ -134,38 +149,36 @@ fn main() -> Result<(), RdmaCmError> {
             println!("Creating queue pairs.");
             let mut pd = cm_connection.allocate_protection_domain()?;
             let cq = cm_connection.create_cq::<100>()?;
-            let mut qp = cm_connection.create_qp(&pd, &cq);
+            let qp = cm_connection.create_qp(&pd, &cq);
 
+            let mut memory: RegisteredMemory<u64, 1> = pd.allocate_memory::<u64, 1>();
+
+            let connection_data = PeerConnectionData {
+                remote_address: memory.memory.as_mut_ptr(),
+                rkey: memory.get_rkey(),
+            };
+
+            println!("Sending connection data: {:?}", connection_data);
+            cm_connection.connect_with_data(&connection_data)?;
             println!("Client: Connecting...");
-            cm_connection.connect()?;
 
             let event = cm_connection.get_cm_event()?;
             assert_eq!(RdmaCmEvent::Established, event.get_event());
             event.ack();
 
-            let mut memory = pd.allocate_memory::<u64, 1>();
-            memory.as_mut_slice(1)[0] = 42;
-            println!("pd, cq, and mr allocated!");
-
-            let work = vec![(1, memory)];
-            qp.post_send(work.iter(), PostSendOpcode::WrSend);
-
-            let mut done = false;
-            while !done {
-                if let Some(entries) = cq.poll() {
-                    for e in entries {
-                        assert_eq!(1, e.wr_id, "Incorrect work request id.");
-                        assert_eq!(e.status, 0, "Other completion status found.");
-                        println!("Client's value sent!");
-                        done = true;
+            println!("Waiting for server to write to our memory...");
+            unsafe {
+                loop {
+                    let ptr = memory.memory.as_ptr() as *const [u64; 1];
+                    let value: [u64; 1] = std::ptr::read_volatile(ptr);
+                    if value != [0] {
+                        println!("Server set value to: {:?}", value);
                         break;
                     }
                 }
             }
 
-            println!("Disconnecting...");
-            drop(work);
-
+            drop(memory);
             cm_connection.disconnect()?;
             let event = cm_connection.get_cm_event()?;
             assert_eq!(event.get_event(), RdmaCmEvent::Disconnected);

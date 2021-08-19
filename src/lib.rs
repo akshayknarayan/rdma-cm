@@ -1,7 +1,8 @@
 pub mod error;
 pub mod ffi;
+mod utils;
 
-use nix::sys::socket::{InetAddr, SockAddr};
+use nix::sys::socket::SockAddr;
 use std::convert::TryFrom;
 use std::ffi::{c_void, CString};
 use std::mem::MaybeUninit;
@@ -14,9 +15,6 @@ use std::io::Error;
 use std::ptr::{null, null_mut};
 
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::Arc;
-use tracing::trace;
 
 /// Direct translation of rdma cm event types into an enum. Use the bindgen values to ensure our
 /// events are correctly labeled even if they change in a different header version.
@@ -95,7 +93,10 @@ impl CmEvent {
 
     pub fn get_connection_request_id(&self) -> CommunicationManager {
         if self.get_event() != RdmaCmEvent::ConnectionRequest {
-            panic!("get_connection_request_id only makes sense for ConnectRequest event!");
+            panic!(
+                "{} only makes sense for ConnectRequest event!",
+                fn_basename!()
+            );
         }
         let cm_id = unsafe { (*self.event).id };
         CommunicationManager {
@@ -105,13 +106,14 @@ impl CmEvent {
         }
     }
 
-    pub fn get_private_data<T: 'static + Copy>(&self) -> Option<T> {
+    pub fn get_private_data<T: Copy>(&self) -> Option<T> {
         // TODO: Add other events here?
         match self.get_event() {
             RdmaCmEvent::ConnectionRequest | RdmaCmEvent::Established => {}
             _other => {
                 panic!(
-                    "get_private_data not supported for {:?} event.",
+                    "{} not supported for {:?} event.",
+                    fn_basename!(),
                     self.get_event()
                 );
             }
@@ -231,26 +233,46 @@ impl Drop for ProtectionDomain {
         }
     }
 }
-
 impl ProtectionDomain {
+    /// Return a newly allocated array of type T holding N elements.
+    pub fn allocate_memory<T: Copy + Default, const N: usize>(&mut self) -> RegisteredMemory<T, N> {
+        let memory = utils::vec_to_boxed_array();
+        self.do_registration(memory)
+    }
+
     pub fn register_array<T, const N: usize>(
         &mut self,
-        mut memory: Box<[T; N]>,
+        array: Box<[T; N]>,
+        initialized_elements: usize,
     ) -> RegisteredMemory<T, N> {
-        assert!(memory.len() > 0, "No memory allocated for slice.");
+        assert!(array.len() > 0, "No memory allocated for array.");
+        assert!(
+            initialized_elements < N,
+            "Initialized elements bigger than array."
+        );
+        let mut memory = self.do_registration(array);
+        memory.initialize_length(initialized_elements);
+        memory
+    }
+
+    fn do_registration<T, const N: usize>(
+        &mut self,
+        mut array: Box<[T; N]>,
+    ) -> RegisteredMemory<T, N> {
         let mr = unsafe {
             ffi::ibv_reg_mr(
                 self.pd as *mut _,
-                memory.as_mut_ptr() as *mut _,
-                (memory.len() * std::mem::size_of::<T>()) as u64,
-                ffi::ibv_access_flags_IBV_ACCESS_LOCAL_WRITE as i32,
+                array.as_mut_ptr() as *mut _,
+                (array.len() * std::mem::size_of::<T>()) as u64,
+                (ffi::ibv_access_flags_IBV_ACCESS_LOCAL_WRITE
+                    | ffi::ibv_access_flags_IBV_ACCESS_REMOTE_WRITE) as i32,
             )
         };
         if mr == null_mut() {
             panic!("Unable to register_memory");
         }
 
-        RegisteredMemory::from_array(mr, memory)
+        RegisteredMemory::from_array(mr, array)
     }
 
     pub fn register_chunk<const SIZE: usize>(
@@ -274,11 +296,11 @@ impl ProtectionDomain {
 
         let mut chunks = Vec::with_capacity(SIZE);
         let mut current = ptr;
-        for i in 0..number_of_chunks {
+        for _ in 0..number_of_chunks {
             unsafe {
                 let chunk = Box::from_raw(current as *mut [u8; SIZE]);
                 chunks.push(RegisteredMemory::from_array(mr, chunk));
-                current.add(SIZE);
+                current = current.add(SIZE);
             }
         }
 
@@ -330,6 +352,7 @@ impl<const POLL_ELEMENTS: usize> CompletionQueue<POLL_ELEMENTS> {
 
 /// Wrapper struct for new type pattern so we implement Drop for ffi::ibv_qp.
 #[derive(Clone)]
+#[allow(non_camel_case_types)]
 struct ibv_qp(*mut ffi::ibv_qp);
 
 impl Drop for ibv_qp {
@@ -348,13 +371,19 @@ pub struct QueuePair {
     qp: Rc<ibv_qp>,
 }
 
+#[derive(Copy, Clone)]
+pub enum PostSendOpcode {
+    WrSend,
+    WrRdmaWrite { rkey: u32, remote_address: *mut u64 },
+}
+
 impl QueuePair {
-    pub fn post_send<'a, I, T, const N: usize>(&mut self, work_requests: I)
+    pub fn post_send<'a, I, T, const N: usize>(&mut self, work_requests: I, opcode: PostSendOpcode)
     where
         I: Iterator<Item = &'a (u64, RegisteredMemory<T, N>)> + ExactSizeIterator,
         T: 'static + Copy,
     {
-        self.post_request::<PostSend, I, T, N, 1>(work_requests)
+        self.post_request::<PostSend, I, T, N, 1>(work_requests, opcode)
     }
 
     pub fn post_receive<'a, I, T, const N: usize>(&mut self, work_requests: I)
@@ -362,12 +391,13 @@ impl QueuePair {
         I: Iterator<Item = &'a (u64, RegisteredMemory<T, N>)> + ExactSizeIterator,
         T: 'static + Copy,
     {
-        self.post_request::<PostRecv, I, T, N, 256>(work_requests)
+        self.post_request::<PostRecv, I, T, N, 256>(work_requests, ())
     }
 
     fn post_request<'a, R, I, T, const N: usize, const MAX_REQUEST_SIZE: usize>(
         &mut self,
         work_requests: I,
+        opcode: <R as Request>::OpCode,
     ) where
         I: Iterator<Item = &'a (u64, RegisteredMemory<T, N>)> + ExactSizeIterator,
         // Copy because we only want user sending "dumb" data.
@@ -401,7 +431,7 @@ impl QueuePair {
                 });
             }
 
-            let wr = R::make_work_request(*work_id, &mut sges[i] as *mut _, length <= 512);
+            let wr = R::make_work_request(*work_id, &mut sges[i] as *mut _, length <= 512, opcode);
             unsafe {
                 requests.push_unchecked(wr);
             }
@@ -411,9 +441,8 @@ impl QueuePair {
         R::link(&mut requests);
 
         let mut bad_wr: MaybeUninit<*mut R::WorkRequest> = MaybeUninit::uninit();
-        let request = R::post(self);
+        let ret = R::post(self, requests.as_mut_ptr(), bad_wr.as_mut_ptr());
 
-        let ret = unsafe { request(self.qp.0, requests.as_mut_ptr(), bad_wr.as_mut_ptr()) };
         // Unlike other rdma and ibverbs functions. The return value must be checked against
         // != 0, not == -1.
         if ret != 0 {
@@ -425,18 +454,22 @@ impl QueuePair {
 
 trait Request {
     type WorkRequest;
+    type OpCode: Copy;
+
     fn post(
         qp: &mut QueuePair,
-    ) -> unsafe extern "C" fn(
-        *mut ffi::ibv_qp,
-        *mut Self::WorkRequest,
-        *mut *mut Self::WorkRequest,
+        work_requests: *mut Self::WorkRequest,
+        bad_work_request: *mut *mut Self::WorkRequest,
     ) -> i32;
 
     fn memory_size<T, const N: usize>(memory: &RegisteredMemory<T, N>) -> usize;
 
-    fn make_work_request(wr_id: u64, sg_list: *mut ffi::ibv_sge, inline: bool)
-        -> Self::WorkRequest;
+    fn make_work_request(
+        wr_id: u64,
+        sg_list: *mut ffi::ibv_sge,
+        inline: bool,
+        opcode: Self::OpCode,
+    ) -> Self::WorkRequest;
 
     fn link<const N: usize>(requests: &mut ArrayVec<Self::WorkRequest, N>);
 }
@@ -445,20 +478,21 @@ enum PostSend {}
 
 impl Request for PostSend {
     type WorkRequest = ffi::ibv_send_wr;
+    type OpCode = PostSendOpcode;
 
     fn post(
         qp: &mut QueuePair,
-    ) -> unsafe extern "C" fn(
-        *mut ffi::ibv_qp,
-        *mut Self::WorkRequest,
-        *mut *mut Self::WorkRequest,
+        work_requests: *mut Self::WorkRequest,
+        bad_work_request: *mut *mut Self::WorkRequest,
     ) -> i32 {
-        unsafe {
+        let post_send = unsafe {
             (*(*(*qp).qp.0).context)
                 .ops
                 .post_send
                 .expect("Function pointer for post_send missing?")
-        }
+        };
+
+        unsafe { post_send(qp.qp.0, work_requests, bad_work_request) }
     }
 
     /// Only register the memory that has been written to with the device.
@@ -470,6 +504,7 @@ impl Request for PostSend {
         wr_id: u64,
         sg_list: *mut ffi::ibv_sge,
         inline: bool,
+        opcode: Self::OpCode,
     ) -> Self::WorkRequest {
         let work_request_template: Self::WorkRequest = unsafe { std::mem::zeroed() };
         let inline = if inline {
@@ -478,13 +513,35 @@ impl Request for PostSend {
             0
         };
 
-        Self::WorkRequest {
-            wr_id,
-            sg_list,
-            num_sge: 1,
-            opcode: ffi::ibv_wr_opcode_IBV_WR_SEND,
-            send_flags: ffi::ibv_send_flags_IBV_SEND_SIGNALED | inline,
-            ..work_request_template
+        match opcode {
+            PostSendOpcode::WrSend => Self::WorkRequest {
+                wr_id,
+                sg_list,
+                num_sge: 1,
+                opcode: ffi::ibv_wr_opcode_IBV_WR_SEND,
+                send_flags: ffi::ibv_send_flags_IBV_SEND_SIGNALED | inline,
+                ..work_request_template
+            },
+            PostSendOpcode::WrRdmaWrite {
+                rkey,
+                remote_address,
+            } => {
+                let rdma = ffi::ibv_send_wr__bindgen_ty_2 {
+                    rdma: ffi::ibv_send_wr__bindgen_ty_2__bindgen_ty_1 {
+                        remote_addr: remote_address as u64,
+                        rkey,
+                    },
+                };
+                Self::WorkRequest {
+                    wr_id,
+                    sg_list,
+                    num_sge: 1,
+                    opcode: ffi::ibv_wr_opcode_IBV_WR_RDMA_WRITE,
+                    wr: rdma,
+                    send_flags: ffi::ibv_send_flags_IBV_SEND_SIGNALED | inline,
+                    ..work_request_template
+                }
+            }
         }
     }
 
@@ -499,20 +556,21 @@ enum PostRecv {}
 
 impl Request for PostRecv {
     type WorkRequest = ffi::ibv_recv_wr;
+    type OpCode = ();
 
     fn post(
         qp: &mut QueuePair,
-    ) -> unsafe extern "C" fn(
-        *mut ffi::ibv_qp,
-        *mut Self::WorkRequest,
-        *mut *mut Self::WorkRequest,
+        work_requests: *mut Self::WorkRequest,
+        bad_work_request: *mut *mut Self::WorkRequest,
     ) -> i32 {
-        unsafe {
+        let post_recv = unsafe {
             (*(*(*qp).qp.0).context)
                 .ops
                 .post_recv
                 .expect("Function pointer for post_recv missing?")
-        }
+        };
+
+        unsafe { post_recv(qp.qp.0, work_requests, bad_work_request) }
     }
 
     /// Register the whole memory size with the device.
@@ -525,6 +583,7 @@ impl Request for PostRecv {
         wr_id: u64,
         sg_list: *mut ffi::ibv_sge,
         _inline: bool,
+        _config: Self::OpCode,
     ) -> Self::WorkRequest {
         Self::WorkRequest {
             wr_id,
@@ -556,7 +615,7 @@ impl Drop for CommunicationManager {
         let ret = unsafe { ffi::rdma_destroy_id(self.cm_id) };
         if ret != 0 {
             let error = Error::last_os_error();
-            println!("Unable to rdma_destroy_id: {}", error);
+            eprintln!("Unable to rdma_destroy_id: {}", error);
         }
 
         // Not all ids have an event channel. Only the listening id for the initial pairing between
@@ -665,8 +724,18 @@ impl CommunicationManager {
         }
     }
 
-    pub fn connect<T: 'static>(&self, private_data: Option<&T>) -> Result<()> {
+    pub fn connect(&self) -> Result<()> {
+        self.do_connect::<()>(None)
+    }
+
+    /// Use the `private_data` field of `rdma_conn_parmam` to send data along with the connection.
+    pub fn connect_with_data<T: Copy>(&self, private_data: &T) -> Result<()> {
+        self.do_connect(Some(private_data))
+    }
+
+    fn do_connect<T: Copy>(&self, private_data: Option<&T>) -> Result<()> {
         let (ptr, data_size) = CommunicationManager::check_private_data(private_data);
+        println!("Sending {} bytes of private data.", data_size);
         let connection_parameters = ffi::rdma_conn_param {
             private_data: ptr,
             private_data_len: data_size,
@@ -688,7 +757,7 @@ impl CommunicationManager {
     }
 
     /// Convert the passed private data into its pointer and length. Returns (null, 0) if None.
-    fn check_private_data<T: 'static>(private_data: Option<&T>) -> (*mut c_void, u8) {
+    fn check_private_data<T>(private_data: Option<&T>) -> (*mut c_void, u8) {
         let ptr = private_data
             .map(|data| data as *const _ as *mut T as *mut c_void)
             .unwrap_or(null_mut());
@@ -704,7 +773,15 @@ impl CommunicationManager {
         (ptr, data_size as u8)
     }
 
-    pub fn accept<T: 'static>(&self, private_data: Option<&T>) -> Result<()> {
+    pub fn accept(&self) -> Result<()> {
+        self.do_accept::<()>(None)
+    }
+
+    pub fn accept_with_private_data<T: Copy>(&self, private_data: &T) -> Result<()> {
+        self.do_accept(Some(private_data))
+    }
+
+    fn do_accept<T: Copy>(&self, private_data: Option<&T>) -> Result<()> {
         let (ptr, data_size) = CommunicationManager::check_private_data(private_data);
 
         // TODO What are the right values for these parameters?
@@ -747,16 +824,16 @@ impl CommunicationManager {
     }
 
     // TODO wrap return value higher level interface. probably iterator!
-    pub fn get_address_info(inet_address: InetAddr) -> Result<*mut ffi::rdma_addrinfo> {
-        let addr = CString::new(format!("{}", inet_address.ip())).unwrap();
-        let port = CString::new(format!("{}", inet_address.port())).unwrap();
+    pub fn get_address_info(node: &str, service: &str) -> Result<*mut ffi::rdma_addrinfo> {
+        let node = CString::new(node).unwrap();
+        let service = CString::new(service).unwrap();
 
         let mut address_info: MaybeUninit<*mut ffi::rdma_addrinfo> = MaybeUninit::uninit();
 
         let ret = unsafe {
             ffi::rdma_getaddrinfo(
-                addr.as_ptr(),
-                port.as_ptr(),
+                node.as_ptr(),
+                service.as_ptr(),
                 null(),
                 address_info.as_mut_ptr(),
             )
