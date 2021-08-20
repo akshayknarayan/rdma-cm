@@ -1,3 +1,4 @@
+#[allow()]
 pub mod error;
 pub mod ffi;
 mod utils;
@@ -8,12 +9,16 @@ use std::ffi::{c_void, CString};
 use std::mem::MaybeUninit;
 
 use crate::error::RdmaCmError;
-use crate::error::Result;
+pub use crate::error::Result;
 use arrayvec::ArrayVec;
 use std::cmp::max;
 use std::io::Error;
 use std::ptr::{null, null_mut};
 
+#[allow(unused_imports)]
+use tracing::{debug, info, trace};
+
+use std::marker::PhantomData;
 use std::rc::Rc;
 
 /// Direct translation of rdma cm event types into an enum. Use the bindgen values to ensure our
@@ -102,7 +107,6 @@ impl CmEvent {
         CommunicationManager {
             cm_id,
             event_channel: None,
-            disconnected: false,
         }
     }
 
@@ -145,15 +149,16 @@ impl CmEvent {
     }
 }
 
-pub struct RegisteredMemory<T, const N: usize> {
+pub struct RegisteredMemory<'pd, T, const N: usize> {
     pub memory: Box<[T; N]>,
     /// Amounts of bytes actually accessed. Allows us to only send the bytes actually accessed by
     /// user.
     accessed: usize,
     mr: *mut ffi::ibv_mr,
+    lifetime: PhantomData<&'pd ()>,
 }
 
-impl<T, const N: usize> Drop for RegisteredMemory<T, N> {
+impl<'pd, T, const N: usize> Drop for RegisteredMemory<'pd, T, N> {
     fn drop(&mut self) {
         let ret = unsafe { ffi::ibv_dereg_mr(self.mr) };
         if ret != 0 {
@@ -163,12 +168,13 @@ impl<T, const N: usize> Drop for RegisteredMemory<T, N> {
     }
 }
 
-impl<T, const N: usize> RegisteredMemory<T, N> {
-    fn from_array(mr: *mut ffi::ibv_mr, memory: Box<[T; N]>) -> RegisteredMemory<T, N> {
+impl<'pd, T, const N: usize> RegisteredMemory<'pd, T, N> {
+    fn from_array(mr: *mut ffi::ibv_mr, memory: Box<[T; N]>) -> RegisteredMemory<'pd, T, N> {
         RegisteredMemory {
             memory,
             mr,
             accessed: 0,
+            lifetime: PhantomData,
         }
     }
 
@@ -220,11 +226,12 @@ impl<T, const N: usize> RegisteredMemory<T, N> {
     }
 }
 
-pub struct ProtectionDomain {
+pub struct ProtectionDomain<'a> {
     pd: *mut ffi::ibv_pd,
+    lifetime: PhantomData<&'a ()>,
 }
 
-impl Drop for ProtectionDomain {
+impl<'a> Drop for ProtectionDomain<'a> {
     fn drop(&mut self) {
         let ret = unsafe { ffi::ibv_dealloc_pd(self.pd) };
         if ret != 0 {
@@ -233,9 +240,9 @@ impl Drop for ProtectionDomain {
         }
     }
 }
-impl ProtectionDomain {
+impl<'a> ProtectionDomain<'a> {
     /// Return a newly allocated array of type T holding N elements.
-    pub fn allocate_memory<T: Copy + Default, const N: usize>(&mut self) -> RegisteredMemory<T, N> {
+    pub fn allocate_memory<T: Copy + Default, const N: usize>(&self) -> RegisteredMemory<T, N> {
         let memory = utils::vec_to_boxed_array();
         self.do_registration(memory)
     }
@@ -255,10 +262,7 @@ impl ProtectionDomain {
         memory
     }
 
-    fn do_registration<T, const N: usize>(
-        &mut self,
-        mut array: Box<[T; N]>,
-    ) -> RegisteredMemory<T, N> {
+    fn do_registration<T, const N: usize>(&self, mut array: Box<[T; N]>) -> RegisteredMemory<T, N> {
         let mr = unsafe {
             ffi::ibv_reg_mr(
                 self.pd as *mut _,
@@ -308,11 +312,12 @@ impl ProtectionDomain {
     }
 }
 
-pub struct CompletionQueue<const POLL_ELEMENTS: usize> {
+pub struct CompletionQueue<'ctx, const POLL_ELEMENTS: usize> {
     cq: *mut ffi::ibv_cq,
+    lifetime: PhantomData<&'ctx ()>,
 }
 
-impl<const POLL_ELEMENTS: usize> Drop for CompletionQueue<POLL_ELEMENTS> {
+impl<'ctx, const POLL_ELEMENTS: usize> Drop for CompletionQueue<'ctx, POLL_ELEMENTS> {
     fn drop(&mut self) {
         let ret = unsafe { ffi::ibv_destroy_cq(self.cq) };
         if ret != 0 {
@@ -322,7 +327,7 @@ impl<const POLL_ELEMENTS: usize> Drop for CompletionQueue<POLL_ELEMENTS> {
     }
 }
 
-impl<const POLL_ELEMENTS: usize> CompletionQueue<POLL_ELEMENTS> {
+impl<'ctx, const POLL_ELEMENTS: usize> CompletionQueue<'ctx, POLL_ELEMENTS> {
     pub fn poll(&self) -> Option<arrayvec::IntoIter<ffi::ibv_wc, POLL_ELEMENTS>> {
         let mut entries: ArrayVec<ffi::ibv_wc, POLL_ELEMENTS> = ArrayVec::new_const();
 
@@ -367,8 +372,9 @@ impl Drop for ibv_qp {
 
 /// Allow QueuePair to be Cloned. This is totally safe.
 #[derive(Clone)]
-pub struct QueuePair {
+pub struct QueuePair<'res> {
     qp: Rc<ibv_qp>,
+    lifetime: PhantomData<&'res ()>,
 }
 
 #[derive(Copy, Clone)]
@@ -377,29 +383,35 @@ pub enum PostSendOpcode {
     WrRdmaWrite { rkey: u32, remote_address: *mut u64 },
 }
 
-impl QueuePair {
-    pub fn post_send<'a, I, T, const N: usize>(&mut self, work_requests: I, opcode: PostSendOpcode)
-    where
-        I: Iterator<Item = &'a (u64, RegisteredMemory<T, N>)> + ExactSizeIterator,
+impl<'res> QueuePair<'res> {
+    pub fn post_send<'pd, 'a, I, T, const N: usize>(
+        &mut self,
+        work_requests: I,
+        opcode: PostSendOpcode,
+    ) where
+        I: Iterator<Item = &'a (u64, RegisteredMemory<'pd, T, N>)> + ExactSizeIterator,
         T: 'static + Copy,
+        'pd: 'a,
     {
         self.post_request::<PostSend, I, T, N, 1>(work_requests, opcode)
     }
 
-    pub fn post_receive<'a, I, T, const N: usize>(&mut self, work_requests: I)
+    pub fn post_receive<'pd, 'a, I, T, const N: usize>(&mut self, work_requests: I)
     where
-        I: Iterator<Item = &'a (u64, RegisteredMemory<T, N>)> + ExactSizeIterator,
+        I: Iterator<Item = &'a (u64, RegisteredMemory<'pd, T, N>)> + ExactSizeIterator,
         T: 'static + Copy,
+        'pd: 'a,
     {
         self.post_request::<PostRecv, I, T, N, 256>(work_requests, ())
     }
 
-    fn post_request<'a, R, I, T, const N: usize, const MAX_REQUEST_SIZE: usize>(
+    fn post_request<'pd, 'a, R, I, T, const N: usize, const MAX_REQUEST_SIZE: usize>(
         &mut self,
         work_requests: I,
         opcode: <R as Request>::OpCode,
     ) where
-        I: Iterator<Item = &'a (u64, RegisteredMemory<T, N>)> + ExactSizeIterator,
+        I: Iterator<Item = &'a (u64, RegisteredMemory<'pd, T, N>)> + ExactSizeIterator,
+        'pd: 'a,
         // Copy because we only want user sending "dumb" data.
         T: 'static + Copy,
         R: Request,
@@ -606,8 +618,6 @@ pub struct CommunicationManager {
     /// If the CommunicationManager is used for connecting two nodes it needs an event channel.
     /// We keep a reference to it for deallocation.
     event_channel: Option<*mut ffi::rdma_event_channel>,
-    /// Whether user explicitly called disconnect or not?
-    disconnected: bool,
 }
 
 impl Drop for CommunicationManager {
@@ -629,6 +639,8 @@ impl Drop for CommunicationManager {
 
 impl CommunicationManager {
     pub fn new() -> Result<Self> {
+        info!("{}", function_name!());
+
         let event_channel: *mut ffi::rdma_event_channel =
             unsafe { ffi::rdma_create_event_channel() };
         if event_channel == null_mut() {
@@ -651,7 +663,6 @@ impl CommunicationManager {
         Ok(CommunicationManager {
             cm_id: unsafe { id.assume_init() },
             event_channel: Some(event_channel),
-            disconnected: false,
         })
     }
 
@@ -668,15 +679,22 @@ impl CommunicationManager {
         context
     }
 
-    pub fn allocate_protection_domain(&self) -> Result<ProtectionDomain> {
+    pub fn allocate_protection_domain<'a>(&'a self) -> Result<ProtectionDomain<'a>> {
+        info!("{}", function_name!());
+
         let pd = unsafe { ffi::ibv_alloc_pd(self.get_raw_verbs_context()) };
         if pd == null_mut() {
             return Err(RdmaCmError::ProtectionDomain);
         }
-        Ok(ProtectionDomain { pd })
+        Ok(ProtectionDomain {
+            pd,
+            lifetime: PhantomData,
+        })
     }
 
     pub fn create_cq<const ELEMENTS: usize>(&self) -> Result<CompletionQueue<ELEMENTS>> {
+        info!("{}", function_name!());
+
         let cq = unsafe {
             ffi::ibv_create_cq(
                 self.get_raw_verbs_context(),
@@ -690,14 +708,24 @@ impl CommunicationManager {
             return Err(RdmaCmError::CreateCompletionQueue(Error::last_os_error()));
         }
 
-        Ok(CompletionQueue { cq })
+        Ok(CompletionQueue {
+            cq,
+            lifetime: PhantomData,
+        })
     }
 
-    pub fn create_qp<const ELEMENTS: usize>(
-        &self,
-        pd: &ProtectionDomain,
-        cq: &CompletionQueue<ELEMENTS>,
-    ) -> QueuePair {
+    pub fn create_qp<'ctx, 'res, 'pd, 'cq, const ELEMENTS: usize>(
+        &'ctx self,
+        pd: &'pd ProtectionDomain<'_>,
+        cq: &'cq CompletionQueue<'_, ELEMENTS>,
+    ) -> QueuePair<'res>
+    where
+        'ctx: 'res,
+        'pd: 'res,
+        'cq: 'res,
+    {
+        info!("{}", function_name!());
+
         let qp_init_attr: ffi::ibv_qp_init_attr = ffi::ibv_qp_init_attr {
             qp_context: null_mut(),
             send_cq: cq.cq,
@@ -721,15 +749,18 @@ impl CommunicationManager {
 
         QueuePair {
             qp: unsafe { Rc::new(ibv_qp((*self.cm_id).qp)) },
+            lifetime: PhantomData,
         }
     }
 
     pub fn connect(&self) -> Result<()> {
+        info!("{}", function_name!());
         self.do_connect::<()>(None)
     }
 
     /// Use the `private_data` field of `rdma_conn_parmam` to send data along with the connection.
     pub fn connect_with_data<T: Copy>(&self, private_data: &T) -> Result<()> {
+        info!("{}", function_name!());
         self.do_connect(Some(private_data))
     }
 
@@ -773,11 +804,15 @@ impl CommunicationManager {
         (ptr, data_size as u8)
     }
 
+    /// WARNING: The pd, cq, and qp must be allocated before calling `accept` otherwise the program
+    /// will get stuck!
     pub fn accept(&self) -> Result<()> {
+        info!("{}", function_name!());
         self.do_accept::<()>(None)
     }
 
     pub fn accept_with_private_data<T: Copy>(&self, private_data: &T) -> Result<()> {
+        info!("{}", function_name!());
         self.do_accept(Some(private_data))
     }
 
@@ -805,6 +840,7 @@ impl CommunicationManager {
     }
 
     pub fn bind(&self, socket_address: &SockAddr) -> Result<()> {
+        info!("{}. SockAddr: {:?}", function_name!(), socket_address);
         let (addr, _len) = socket_address.as_ffi_pair();
 
         let ret = unsafe { ffi::rdma_bind_addr(self.cm_id, addr as *const _ as *mut _) };
@@ -815,6 +851,7 @@ impl CommunicationManager {
     }
 
     pub fn listen(&self) -> Result<()> {
+        info!("{}", function_name!());
         let ret = unsafe { ffi::rdma_listen(self.cm_id, 100) };
 
         if ret == -1 {
@@ -825,6 +862,8 @@ impl CommunicationManager {
 
     // TODO wrap return value higher level interface. probably iterator!
     pub fn get_address_info(node: &str, service: &str) -> Result<*mut ffi::rdma_addrinfo> {
+        info!("{}", function_name!());
+
         let node = CString::new(node).unwrap();
         let service = CString::new(service).unwrap();
 
@@ -847,6 +886,8 @@ impl CommunicationManager {
     }
 
     pub fn resolve_address(&self, destination_address: *mut ffi::sockaddr) -> Result<()> {
+        info!("{}", function_name!());
+
         assert_ne!(destination_address, null_mut(), "dst_addr is null!");
         let ret = unsafe { ffi::rdma_resolve_addr(self.cm_id, null_mut(), destination_address, 0) };
         if ret == -1 {
@@ -856,6 +897,8 @@ impl CommunicationManager {
     }
 
     pub fn resolve_route(&self, timeout_ms: i32) -> Result<()> {
+        info!("{}", function_name!());
+
         let ret = unsafe { ffi::rdma_resolve_route(self.cm_id, timeout_ms) };
         if ret == -1 {
             return Err(RdmaCmError::ResolveRoute(Error::last_os_error()));
@@ -864,6 +907,8 @@ impl CommunicationManager {
     }
 
     pub fn get_cm_event(&self) -> Result<CmEvent> {
+        info!("{}", function_name!());
+
         let mut cm_events: MaybeUninit<*mut ffi::rdma_cm_event> = MaybeUninit::uninit();
         let ret = unsafe { ffi::rdma_get_cm_event((*self.cm_id).channel, cm_events.as_mut_ptr()) };
         if ret == -1 {
@@ -874,13 +919,14 @@ impl CommunicationManager {
         })
     }
 
-    pub fn disconnect(&mut self) -> Result<()> {
+    pub fn disconnect(&self) -> Result<()> {
+        info!("{}", function_name!());
+
         let ret = unsafe { ffi::rdma_disconnect(self.cm_id) };
         if ret == -1 {
             return Err(RdmaCmError::Disconnect(Error::last_os_error()));
         }
 
-        self.disconnected = true;
         Ok(())
     }
 }
