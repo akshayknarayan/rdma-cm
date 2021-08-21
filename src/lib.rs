@@ -18,7 +18,6 @@ use std::ptr::{null, null_mut};
 #[allow(unused_imports)]
 use tracing::{debug, info, trace};
 
-use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
 use std::rc::Rc;
 
@@ -144,16 +143,15 @@ impl CmEvent {
     }
 }
 
-pub struct RegisteredMemory<'pd, T, const N: usize> {
+pub struct RegisteredMemory<T, const N: usize> {
     memory: Box<[T; N]>,
     /// Amounts of bytes actually accessed. Allows us to only send the bytes actually accessed by
     /// user.
     accessed: usize,
     mr: *mut ffi::ibv_mr,
-    lifetime: PhantomData<&'pd ()>,
 }
 
-impl<'pd, T, const N: usize> Drop for RegisteredMemory<'pd, T, N> {
+impl<T, const N: usize> Drop for RegisteredMemory<T, N> {
     fn drop(&mut self) {
         let ret = unsafe { ffi::ibv_dereg_mr(self.mr) };
         if ret != 0 {
@@ -163,13 +161,12 @@ impl<'pd, T, const N: usize> Drop for RegisteredMemory<'pd, T, N> {
     }
 }
 
-impl<'pd, T, const N: usize> RegisteredMemory<'pd, T, N> {
-    fn new(mr: *mut ffi::ibv_mr, memory: Box<[T; N]>) -> RegisteredMemory<'pd, T, N> {
+impl<T, const N: usize> RegisteredMemory<T, N> {
+    fn new(mr: *mut ffi::ibv_mr, memory: Box<[T; N]>) -> RegisteredMemory<T, N> {
         RegisteredMemory {
             memory,
             mr,
             accessed: 0,
-            lifetime: PhantomData,
         }
     }
 
@@ -231,12 +228,11 @@ impl<'pd, T, const N: usize> RegisteredMemory<'pd, T, N> {
     }
 }
 
-pub struct ProtectionDomain<'a> {
+pub struct ProtectionDomain {
     pd: *mut ffi::ibv_pd,
-    lifetime: PhantomData<&'a ()>,
 }
 
-impl<'a> Drop for ProtectionDomain<'a> {
+impl Drop for ProtectionDomain {
     fn drop(&mut self) {
         let ret = unsafe { ffi::ibv_dealloc_pd(self.pd) };
         if ret != 0 {
@@ -245,7 +241,7 @@ impl<'a> Drop for ProtectionDomain<'a> {
         }
     }
 }
-impl<'a> ProtectionDomain<'a> {
+impl ProtectionDomain {
     /// Return a newly allocated array of type T holding N elements.
     pub fn allocate_memory<T: Copy + Default, const N: usize>(&self) -> RegisteredMemory<T, N> {
         let memory = utils::vec_to_boxed_array();
@@ -317,12 +313,11 @@ impl<'a> ProtectionDomain<'a> {
     }
 }
 
-pub struct CompletionQueue<'ctx, const POLL_ELEMENTS: usize> {
+pub struct CompletionQueue<const POLL_ELEMENTS: usize> {
     cq: *mut ffi::ibv_cq,
-    lifetime: PhantomData<&'ctx ()>,
 }
 
-impl<'ctx, const POLL_ELEMENTS: usize> Drop for CompletionQueue<'ctx, POLL_ELEMENTS> {
+impl<const POLL_ELEMENTS: usize> Drop for CompletionQueue<POLL_ELEMENTS> {
     fn drop(&mut self) {
         let ret = unsafe { ffi::ibv_destroy_cq(self.cq) };
         if ret != 0 {
@@ -332,7 +327,7 @@ impl<'ctx, const POLL_ELEMENTS: usize> Drop for CompletionQueue<'ctx, POLL_ELEME
     }
 }
 
-impl<'ctx, const POLL_ELEMENTS: usize> CompletionQueue<'ctx, POLL_ELEMENTS> {
+impl<const POLL_ELEMENTS: usize> CompletionQueue<POLL_ELEMENTS> {
     pub fn poll(&self) -> Option<arrayvec::IntoIter<ffi::ibv_wc, POLL_ELEMENTS>> {
         let mut entries: ArrayVec<ffi::ibv_wc, POLL_ELEMENTS> = ArrayVec::new_const();
 
@@ -377,9 +372,8 @@ impl Drop for ibv_qp {
 
 /// Allow QueuePair to be Cloned. This is totally safe.
 #[derive(Clone)]
-pub struct QueuePair<'res> {
+pub struct QueuePair {
     qp: Rc<ibv_qp>,
-    lifetime: PhantomData<&'res ()>,
 }
 
 /// TODO Carry around type information <T> for the type?
@@ -389,35 +383,29 @@ pub enum PostSendOpcode {
     RdmaWrite { rkey: u32, remote_address: *mut u64 },
 }
 
-impl<'res> QueuePair<'res> {
-    pub fn post_send<'pd, 'a, I, T, const N: usize>(
-        &mut self,
-        work_requests: I,
-        opcode: PostSendOpcode,
-    ) where
-        I: Iterator<Item = &'a (u64, RegisteredMemory<'pd, T, N>)> + ExactSizeIterator,
+impl QueuePair {
+    pub fn post_send<'a, I, T, const N: usize>(&mut self, work_requests: I, opcode: PostSendOpcode)
+    where
+        I: Iterator<Item = &'a (u64, RegisteredMemory<T, N>)> + ExactSizeIterator,
         T: 'static + Copy,
-        'pd: 'a,
     {
         self.post_request::<PostSend, I, T, N, 1>(work_requests, opcode)
     }
 
-    pub fn post_receive<'pd, 'a, I, T, const N: usize>(&mut self, work_requests: I)
+    pub fn post_receive<'a, I, T, const N: usize>(&mut self, work_requests: I)
     where
-        I: Iterator<Item = &'a (u64, RegisteredMemory<'pd, T, N>)> + ExactSizeIterator,
+        I: Iterator<Item = &'a (u64, RegisteredMemory<T, N>)> + ExactSizeIterator,
         T: 'static + Copy,
-        'pd: 'a,
     {
         self.post_request::<PostRecv, I, T, N, 256>(work_requests, ())
     }
 
-    fn post_request<'pd, 'a, R, I, T, const N: usize, const MAX_REQUEST_SIZE: usize>(
+    fn post_request<'a, R, I, T, const N: usize, const MAX_REQUEST_SIZE: usize>(
         &mut self,
         work_requests: I,
         opcode: <R as Request>::OpCode,
     ) where
-        I: Iterator<Item = &'a (u64, RegisteredMemory<'pd, T, N>)> + ExactSizeIterator,
-        'pd: 'a,
+        I: Iterator<Item = &'a (u64, RegisteredMemory<T, N>)> + ExactSizeIterator,
         // Copy because we only want user sending "dumb" data.
         T: 'static + Copy,
         R: Request,
@@ -691,10 +679,7 @@ impl CommunicationManager {
         if pd == null_mut() {
             return Err(RdmaCmError::ProtectionDomain);
         }
-        Ok(ProtectionDomain {
-            pd,
-            lifetime: PhantomData,
-        })
+        Ok(ProtectionDomain { pd })
     }
 
     pub fn create_cq<const ELEMENTS: usize>(&self) -> Result<CompletionQueue<ELEMENTS>> {
@@ -713,22 +698,14 @@ impl CommunicationManager {
             return Err(RdmaCmError::CreateCompletionQueue(Error::last_os_error()));
         }
 
-        Ok(CompletionQueue {
-            cq,
-            lifetime: PhantomData,
-        })
+        Ok(CompletionQueue { cq })
     }
 
-    pub fn create_qp<'ctx, 'res, 'pd, 'cq, const ELEMENTS: usize>(
-        &'ctx self,
-        pd: &'pd ProtectionDomain<'_>,
-        cq: &'cq CompletionQueue<'_, ELEMENTS>,
-    ) -> QueuePair<'res>
-    where
-        'ctx: 'res,
-        'pd: 'res,
-        'cq: 'res,
-    {
+    pub fn create_qp<const ELEMENTS: usize>(
+        &self,
+        pd: &ProtectionDomain,
+        cq: &CompletionQueue<ELEMENTS>,
+    ) -> QueuePair {
         info!("{}", function_name!());
 
         let qp_init_attr: ffi::ibv_qp_init_attr = ffi::ibv_qp_init_attr {
@@ -754,7 +731,6 @@ impl CommunicationManager {
 
         QueuePair {
             qp: unsafe { Rc::new(ibv_qp((*self.cm_id).qp)) },
-            lifetime: PhantomData,
         }
     }
 
@@ -950,15 +926,15 @@ impl CommunicationManager {
     }
 }
 
-pub struct VolatileRdmaMemory<'pd, T, const N: usize> {
-    memory: RegisteredMemory<'pd, T, N>,
+pub struct VolatileRdmaMemory<T, const N: usize> {
+    memory: RegisteredMemory<T, N>,
 }
 
-impl<'pd, T, const N: usize> VolatileRdmaMemory<'pd, T, N>
+impl<T, const N: usize> VolatileRdmaMemory<T, N>
 where
     T: Copy + Default,
 {
-    pub fn new(pd: &'pd ProtectionDomain<'_>) -> VolatileRdmaMemory<'pd, T, N> {
+    pub fn new(pd: &ProtectionDomain) -> VolatileRdmaMemory<T, N> {
         let memory = pd.allocate_memory();
         VolatileRdmaMemory { memory }
     }
