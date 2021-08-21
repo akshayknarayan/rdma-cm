@@ -109,7 +109,7 @@ fn rdma_send_byte_client() -> Result<(), RdmaCmError> {
     memory.as_mut_slice(1)[0] = 42;
 
     let work = vec![(1, memory)];
-    qp.post_send(work.iter(), PostSendOpcode::WrSend);
+    qp.post_send(work.iter(), PostSendOpcode::Send);
 
     let mut done = false;
     while !done {

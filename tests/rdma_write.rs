@@ -1,17 +1,12 @@
 use nix::sys::socket::{InetAddr, SockAddr};
 use rdma_cm;
 use rdma_cm::error::RdmaCmError;
-use rdma_cm::{CommunicationManager, PostSendOpcode, RdmaCmEvent, RegisteredMemory};
+use rdma_cm::{
+    CommunicationManager, PeerConnectionData, RdmaCmEvent, RegisteredMemory, VolatileRdmaMemory,
+};
 use std::net::SocketAddr;
 use std::ptr::null_mut;
 use tracing_subscriber::EnvFilter;
-/// Connection data transmitted through the private data struct fields by our `connect` and `accept`
-/// function to set up one-sided RDMA. (u64, u32) are (address of volatile_send_window, rkey).
-#[derive(Clone, Copy, Debug)]
-pub struct PeerConnectionData {
-    remote_address: *mut u64,
-    rkey: u32,
-}
 
 #[test]
 fn rdma_write() -> rdma_cm::Result<()> {
@@ -41,8 +36,7 @@ fn rdma_write_server(server_is_ready: Box<dyn Fn()>) -> Result<(), RdmaCmError> 
 
     let connected_id = event.get_connection_request_id();
 
-    let peer: PeerConnectionData = event.get_private_data().expect("Private data missing!");
-    dbg!(peer);
+    let peer: PeerConnectionData<u64, 1> = event.get_private_data().expect("Private data missing!");
     event.ack();
 
     let pd = connected_id.allocate_protection_domain()?;
@@ -58,12 +52,7 @@ fn rdma_write_server(server_is_ready: Box<dyn Fn()>) -> Result<(), RdmaCmError> 
     memory.as_mut_slice(1)[0] = 42;
     let work = vec![(1, memory)];
 
-    let rdma_write = PostSendOpcode::WrRdmaWrite {
-        rkey: peer.rkey,
-        remote_address: peer.remote_address,
-    };
-
-    qp.post_send(work.iter(), rdma_write);
+    qp.post_send(work.iter(), peer.as_rdma_write());
 
     loop {
         if let Some(mut entries) = cq.poll() {
@@ -112,27 +101,18 @@ fn rdma_write_client() -> Result<(), RdmaCmError> {
     let cq = cm_connection.create_cq::<100>()?;
     let _qp = cm_connection.create_qp(&pd, &cq);
 
-    let mut memory: RegisteredMemory<u64, 1> = pd.allocate_memory::<u64, 1>();
-
-    let connection_data = PeerConnectionData {
-        remote_address: memory.memory.as_mut_ptr(),
-        rkey: memory.get_rkey(),
-    };
-    dbg!(connection_data);
-    cm_connection.connect_with_data(&connection_data)?;
+    let mut memory = VolatileRdmaMemory::<u64, 1>::new(&pd);
+    cm_connection.connect_with_data(&memory.as_connection_data())?;
 
     let event = cm_connection.get_cm_event()?;
     assert_eq!(RdmaCmEvent::Established, event.get_event());
     event.ack();
 
-    let ptr = memory.memory.as_ptr() as *const [u64; 1];
-    unsafe {
-        loop {
-            let value: [u64; 1] = std::ptr::read_volatile(ptr);
-            if value != [0] {
-                println!("Server set value to: {:?}", value);
-                break;
-            }
+    loop {
+        let value = memory.read();
+        if value != [0] {
+            println!("Server set value to: {:?}", value);
+            break;
         }
     }
 

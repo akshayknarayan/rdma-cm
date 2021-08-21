@@ -19,6 +19,7 @@ use std::ptr::{null, null_mut};
 use tracing::{debug, info, trace};
 
 use std::marker::PhantomData;
+use std::ops::{Deref, DerefMut};
 use std::rc::Rc;
 
 /// Direct translation of rdma cm event types into an enum. Use the bindgen values to ensure our
@@ -110,7 +111,7 @@ impl CmEvent {
         }
     }
 
-    pub fn get_private_data<T: Copy>(&self) -> Option<T> {
+    pub fn get_private_data<T: 'static + Copy>(&self) -> Option<T> {
         // TODO: Add other events here?
         match self.get_event() {
             RdmaCmEvent::ConnectionRequest | RdmaCmEvent::Established => {}
@@ -124,23 +125,17 @@ impl CmEvent {
         }
 
         let private_data: *const c_void = unsafe { (*self.event).param.conn.private_data };
-        let private_data_length: u8 = unsafe { (*self.event).param.conn.private_data_len };
-
-        // TODO Is there a better way to check the size of the data? This current check is very weak
-        // but private_data_length is pretty much useless from the receiver end...
-        // We could always tack on the size of the private data as a integer in our private data...
-        if std::mem::size_of::<T>() > private_data_length as usize {
-            panic!(
-                "Size of specified type ({:?}) does not match size of actual data: ({:?}) !",
-                std::mem::size_of::<T>(),
-                private_data_length
-            );
-        }
 
         if private_data.is_null() {
             None
         } else {
-            Some(unsafe { *(private_data as *mut T) })
+            let private_data: PrivateData<T> = unsafe { *(private_data as *mut PrivateData<T>) };
+            assert_eq!(
+                std::mem::size_of::<T>(),
+                private_data.data_size as usize,
+                "Size of private data does not match."
+            );
+            Some(private_data.data)
         }
     }
 
@@ -150,7 +145,7 @@ impl CmEvent {
 }
 
 pub struct RegisteredMemory<'pd, T, const N: usize> {
-    pub memory: Box<[T; N]>,
+    memory: Box<[T; N]>,
     /// Amounts of bytes actually accessed. Allows us to only send the bytes actually accessed by
     /// user.
     accessed: usize,
@@ -169,13 +164,23 @@ impl<'pd, T, const N: usize> Drop for RegisteredMemory<'pd, T, N> {
 }
 
 impl<'pd, T, const N: usize> RegisteredMemory<'pd, T, N> {
-    fn from_array(mr: *mut ffi::ibv_mr, memory: Box<[T; N]>) -> RegisteredMemory<'pd, T, N> {
+    fn new(mr: *mut ffi::ibv_mr, memory: Box<[T; N]>) -> RegisteredMemory<'pd, T, N> {
         RegisteredMemory {
             memory,
             mr,
             accessed: 0,
             lifetime: PhantomData,
         }
+    }
+
+    /// By return a pointer to the underlying array.
+    fn as_ptr(&self) -> *const [T; N] {
+        self.memory.deref() as *const _
+    }
+
+    /// By return a mutable pointer to the underlying array.
+    fn as_mut_ptr(&mut self) -> *mut [T; N] {
+        self.memory.deref_mut() as *mut _
     }
 
     fn inner_mr(&self) -> ffi::ibv_mr {
@@ -276,7 +281,7 @@ impl<'a> ProtectionDomain<'a> {
             panic!("Unable to register_memory");
         }
 
-        RegisteredMemory::from_array(mr, array)
+        RegisteredMemory::new(mr, array)
     }
 
     pub fn register_chunk<const SIZE: usize>(
@@ -303,7 +308,7 @@ impl<'a> ProtectionDomain<'a> {
         for _ in 0..number_of_chunks {
             unsafe {
                 let chunk = Box::from_raw(current as *mut [u8; SIZE]);
-                chunks.push(RegisteredMemory::from_array(mr, chunk));
+                chunks.push(RegisteredMemory::new(mr, chunk));
                 current = current.add(SIZE);
             }
         }
@@ -377,10 +382,11 @@ pub struct QueuePair<'res> {
     lifetime: PhantomData<&'res ()>,
 }
 
+/// TODO Carry around type information <T> for the type?
 #[derive(Copy, Clone)]
 pub enum PostSendOpcode {
-    WrSend,
-    WrRdmaWrite { rkey: u32, remote_address: *mut u64 },
+    Send,
+    RdmaWrite { rkey: u32, remote_address: *mut u64 },
 }
 
 impl<'res> QueuePair<'res> {
@@ -416,7 +422,6 @@ impl<'res> QueuePair<'res> {
         T: 'static + Copy,
         R: Request,
     {
-        use std::ops::Deref;
         assert_ne!(
             work_requests.len(),
             0,
@@ -526,7 +531,7 @@ impl Request for PostSend {
         };
 
         match opcode {
-            PostSendOpcode::WrSend => Self::WorkRequest {
+            PostSendOpcode::Send => Self::WorkRequest {
                 wr_id,
                 sg_list,
                 num_sge: 1,
@@ -534,7 +539,7 @@ impl Request for PostSend {
                 send_flags: ffi::ibv_send_flags_IBV_SEND_SIGNALED | inline,
                 ..work_request_template
             },
-            PostSendOpcode::WrRdmaWrite {
+            PostSendOpcode::RdmaWrite {
                 rkey,
                 remote_address,
             } => {
@@ -679,7 +684,7 @@ impl CommunicationManager {
         context
     }
 
-    pub fn allocate_protection_domain<'a>(&'a self) -> Result<ProtectionDomain<'a>> {
+    pub fn allocate_protection_domain(&self) -> Result<ProtectionDomain> {
         info!("{}", function_name!());
 
         let pd = unsafe { ffi::ibv_alloc_pd(self.get_raw_verbs_context()) };
@@ -758,18 +763,16 @@ impl CommunicationManager {
         self.do_connect::<()>(None)
     }
 
-    /// Use the `private_data` field of `rdma_conn_parmam` to send data along with the connection.
-    pub fn connect_with_data<T: Copy>(&self, private_data: &T) -> Result<()> {
+    /// Use the `private_data` field of `rdma_conn_param` to send data along with the connection.
+    pub fn connect_with_data<T: Copy + 'static>(&self, private_data: &T) -> Result<()> {
         info!("{}", function_name!());
         self.do_connect(Some(private_data))
     }
 
-    fn do_connect<T: Copy>(&self, private_data: Option<&T>) -> Result<()> {
-        let (ptr, data_size) = CommunicationManager::check_private_data(private_data);
-        println!("Sending {} bytes of private data.", data_size);
-        let connection_parameters = ffi::rdma_conn_param {
-            private_data: ptr,
-            private_data_len: data_size,
+    fn do_connect<T: Copy + 'static>(&self, private_data: Option<&T>) -> Result<()> {
+        let mut connection_parameters = ffi::rdma_conn_param {
+            private_data: null_mut(),
+            private_data_len: 0,
             responder_resources: 1,
             initiator_depth: 1,
             flow_control: 0,
@@ -779,50 +782,53 @@ impl CommunicationManager {
             qp_num: 0,
         };
 
-        let ret =
-            unsafe { ffi::rdma_connect(self.cm_id, &connection_parameters as *const _ as *mut _) };
+        let ret = match private_data {
+            None => unsafe {
+                ffi::rdma_connect(self.cm_id, &connection_parameters as *const _ as *mut _)
+            },
+            Some(private_data) => {
+                // Safety: private data must exist in stack for call to rdma_connect. Otherwise
+                // .private_data will be a dangling pointer. Do not move rmda_connect outside
+                // this match arm.
+                let mut private_data = PrivateData::<T>::new(*private_data);
+                connection_parameters.private_data = &mut private_data as *mut _ as *mut c_void;
+                connection_parameters.private_data_len = private_data.send_size();
+
+                unsafe {
+                    ffi::rdma_connect(self.cm_id, &connection_parameters as *const _ as *mut _)
+                }
+            }
+        };
+
         if ret == -1 {
             return Err(RdmaCmError::Connect(Error::last_os_error()));
         }
         Ok(())
     }
 
-    /// Convert the passed private data into its pointer and length. Returns (null, 0) if None.
-    fn check_private_data<T>(private_data: Option<&T>) -> (*mut c_void, u8) {
-        let ptr = private_data
-            .map(|data| data as *const _ as *mut T as *mut c_void)
-            .unwrap_or(null_mut());
-        assert!(
-            std::mem::size_of::<T>() < u8::MAX.into(),
-            "private data too large!"
-        );
-        let data_size = if ptr.is_null() {
-            0
-        } else {
-            std::mem::size_of::<T>()
-        };
-        (ptr, data_size as u8)
-    }
-
     /// WARNING: The pd, cq, and qp must be allocated before calling `accept` otherwise the program
     /// will get stuck!
+    /// TODO: Enforce this at runtime or compile time?
     pub fn accept(&self) -> Result<()> {
         info!("{}", function_name!());
         self.do_accept::<()>(None)
     }
 
-    pub fn accept_with_private_data<T: Copy>(&self, private_data: &T) -> Result<()> {
+    pub fn accept_with_private_data<T>(&self, private_data: &T) -> Result<()>
+    where
+        T: Copy + 'static,
+    {
         info!("{}", function_name!());
         self.do_accept(Some(private_data))
     }
 
-    fn do_accept<T: Copy>(&self, private_data: Option<&T>) -> Result<()> {
-        let (ptr, data_size) = CommunicationManager::check_private_data(private_data);
-
-        // TODO What are the right values for these parameters?
-        let connection_parameters = ffi::rdma_conn_param {
-            private_data: ptr,
-            private_data_len: data_size,
+    fn do_accept<T>(&self, private_data: Option<&T>) -> Result<()>
+    where
+        T: Copy + 'static,
+    {
+        let mut connection_parameters = ffi::rdma_conn_param {
+            private_data: null_mut(),
+            private_data_len: 0,
             responder_resources: 1,
             initiator_depth: 1,
             flow_control: 0,
@@ -831,8 +837,21 @@ impl CommunicationManager {
             srq: 0,
             qp_num: 0,
         };
-        let ret =
-            unsafe { ffi::rdma_accept(self.cm_id, &connection_parameters as *const _ as *mut _) };
+
+        let ret = match private_data {
+            None => unsafe {
+                ffi::rdma_accept(self.cm_id, &connection_parameters as *const _ as *mut _)
+            },
+            Some(private_data) => {
+                let mut private_data = PrivateData::<T>::new(*private_data);
+                connection_parameters.private_data = &mut private_data as *mut _ as *mut c_void;
+                connection_parameters.private_data_len = private_data.send_size();
+                unsafe {
+                    ffi::rdma_accept(self.cm_id, &connection_parameters as *const _ as *mut _)
+                }
+            }
+        };
+
         if ret == -1 {
             return Err(RdmaCmError::Accept(Error::last_os_error()));
         }
@@ -928,5 +947,88 @@ impl CommunicationManager {
         }
 
         Ok(())
+    }
+}
+
+pub struct VolatileRdmaMemory<'pd, T, const N: usize> {
+    memory: RegisteredMemory<'pd, T, N>,
+}
+
+impl<'pd, T, const N: usize> VolatileRdmaMemory<'pd, T, N>
+where
+    T: Copy + Default,
+{
+    pub fn new(pd: &'pd ProtectionDomain<'_>) -> VolatileRdmaMemory<'pd, T, N> {
+        let memory = pd.allocate_memory();
+        VolatileRdmaMemory { memory }
+    }
+
+    pub fn as_connection_data(&mut self) -> PeerConnectionData<T, N> {
+        PeerConnectionData {
+            remote_address: self.memory.memory.as_mut_ptr(),
+            rkey: self.memory.get_rkey(),
+        }
+    }
+
+    pub fn read(&mut self) -> [T; N] {
+        unsafe { std::ptr::read_volatile(self.memory.as_ptr()) }
+    }
+
+    pub fn write(&mut self, new_value: &[T; N]) {
+        unsafe { std::ptr::write_volatile(self.memory.as_mut_ptr(), *new_value) };
+    }
+}
+
+/// Data necessary for one-sided RDMA to read/write to peer.
+#[derive(Clone, Copy, Debug)]
+pub struct PeerConnectionData<T, const N: usize> {
+    remote_address: *mut T,
+    rkey: u32,
+}
+
+impl<T, const N: usize> PeerConnectionData<T, N> {
+    /// Convinience method for creating the opcode for one-sided RDMA write to peer.
+    pub fn as_rdma_write(&self) -> PostSendOpcode {
+        PostSendOpcode::RdmaWrite {
+            rkey: self.rkey,
+            remote_address: self.remote_address as *mut u64,
+        }
+    }
+}
+
+/// Private data to send over RDMA CM.
+#[derive(Copy, Clone)]
+struct PrivateData<T: 'static + Copy + Clone> {
+    data: T,
+    /// The size of `T`.
+    data_size: u8,
+}
+
+impl<T: Copy> PrivateData<T> {
+    pub fn new(data: T) -> Self {
+        let size = std::mem::size_of::<T>();
+
+        // TODO: Not actually sure what the max size of private data is.
+        // Here we compare against Self. Since the entire struct, including our size field
+        // needs to be smaller than u8!
+        assert!(
+            std::mem::size_of::<Self>() < u8::MAX.into(),
+            "private data too large!"
+        );
+
+        println!(
+            "Private data <{}> size: {}",
+            std::any::type_name::<T>(),
+            size
+        );
+        PrivateData {
+            data,
+            data_size: size as u8,
+        }
+    }
+
+    /// This is NOT the size of T. It is T + sizeof(our other fields).
+    pub fn send_size(&self) -> u8 {
+        std::mem::size_of::<Self>() as u8
     }
 }
