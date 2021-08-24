@@ -1,7 +1,7 @@
 use nix::sys::socket::{InetAddr, SockAddr};
 use rdma_cm;
 use rdma_cm::error::RdmaCmError;
-use rdma_cm::{CommunicationManager, PostSendOpcode, RdmaCmEvent, RegisteredMemory};
+use rdma_cm::{CommunicationManager, PostSendOpcode, RdmaCmEvent, RdmaMemory};
 use std::net::SocketAddr;
 use std::ptr::null_mut;
 
@@ -45,7 +45,7 @@ fn rdma_send_byte_server(server_is_ready: Box<dyn Fn()>) -> Result<(), RdmaCmErr
     assert_eq!(RdmaCmEvent::Established, event.get_event());
     event.ack();
 
-    let mut memory: RegisteredMemory<u64, 1> = pd.allocate_memory::<u64, 1>();
+    let mut memory: RdmaMemory<u64, 1> = pd.allocate_memory::<u64, 1>();
     memory.as_mut_slice(1)[0] = 42;
     let mut work = vec![(2, memory)];
 
@@ -56,7 +56,7 @@ fn rdma_send_byte_server(server_is_ready: Box<dyn Fn()>) -> Result<(), RdmaCmErr
             for e in entries {
                 assert_eq!(2, e.wr_id, "Incorrect work request id.");
                 assert_eq!(e.status, 0, "Other completion status found.");
-                println!("{:?}", work[0].1.as_mut_slice(1));
+                println!("{:?}", work[0].1.as_mut_slice(1)[0]);
                 done = true;
                 break;
             }

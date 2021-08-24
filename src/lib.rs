@@ -15,11 +15,12 @@ use std::cmp::max;
 use std::io::Error;
 use std::ptr::{null, null_mut};
 
-#[allow(unused_imports)]
-use tracing::{debug, info, trace};
-
+use std::cell::RefCell;
 use std::ops::{Deref, DerefMut};
 use std::rc::Rc;
+use std::slice::SliceIndex;
+#[allow(unused_imports)]
+use tracing::{debug, info, trace};
 
 /// Direct translation of rdma cm event types into an enum. Use the bindgen values to ensure our
 /// events are correctly labeled even if they change in a different header version.
@@ -143,16 +144,43 @@ impl CmEvent {
     }
 }
 
-pub struct RegisteredMemory<T, const N: usize> {
-    memory: Box<[T; N]>,
+pub struct RdmaMemory<T, const N: usize> {
+    memory: RegisteredMemory<T, N>,
     /// Amounts of bytes actually accessed. Allows us to only send the bytes actually accessed by
     /// user.
     accessed: usize,
     mr: *mut ffi::ibv_mr,
 }
 
-impl<T, const N: usize> Drop for RegisteredMemory<T, N> {
+enum RegisteredMemory<T, const N: usize> {
+    Individual {
+        memory: Box<[T; N]>,
+    },
+    SharedChunk {
+        /// We need the starting address to deallocate entire chunk when our ref count hits zero.
+        starting_address: *mut [T],
+        our_slice: *mut [T],
+        /// RC for chunks that share the same underlying registered memory see `register_chunks` fn.
+        rc: Rc<()>,
+    },
+}
+
+impl<T, const N: usize> Drop for RdmaMemory<T, N> {
     fn drop(&mut self) {
+        if let RegisteredMemory::SharedChunk {
+            starting_address,
+            rc,
+            ..
+        } = &self.memory
+        {
+            if Rc::strong_count(&rc) != 1 {
+                return;
+            }
+
+            // This will take care of dropping the entire chunk for us.
+            unsafe { Box::from_raw(*starting_address) };
+        }
+
         let ret = unsafe { ffi::ibv_dereg_mr(self.mr) };
         if ret != 0 {
             let error = Error::last_os_error();
@@ -161,10 +189,27 @@ impl<T, const N: usize> Drop for RegisteredMemory<T, N> {
     }
 }
 
-impl<T, const N: usize> RegisteredMemory<T, N> {
-    fn new(mr: *mut ffi::ibv_mr, memory: Box<[T; N]>) -> RegisteredMemory<T, N> {
-        RegisteredMemory {
-            memory,
+impl<T, const N: usize> RdmaMemory<T, N> {
+    fn new(mr: *mut ffi::ibv_mr, memory: Box<[T; N]>) -> RdmaMemory<T, N> {
+        RdmaMemory {
+            memory: RegisteredMemory::Individual { memory },
+            mr,
+            accessed: 0,
+        }
+    }
+
+    fn new_chunk(
+        mr: *mut ffi::ibv_mr,
+        starting_address: *mut [T],
+        our_slice: *mut [T],
+        rc: Rc<()>,
+    ) -> RdmaMemory<T, N> {
+        RdmaMemory {
+            memory: RegisteredMemory::SharedChunk {
+                starting_address,
+                our_slice,
+                rc,
+            },
             mr,
             accessed: 0,
         }
@@ -172,12 +217,18 @@ impl<T, const N: usize> RegisteredMemory<T, N> {
 
     /// By return a pointer to the underlying array.
     fn as_ptr(&self) -> *const [T; N] {
-        self.memory.deref() as *const _
+        match &self.memory {
+            RegisteredMemory::Individual { memory } => memory.deref() as *const _,
+            RegisteredMemory::SharedChunk { our_slice, .. } => *our_slice as *const _,
+        }
     }
 
     /// By return a mutable pointer to the underlying array.
     fn as_mut_ptr(&mut self) -> *mut [T; N] {
-        self.memory.deref_mut() as *mut _
+        match &mut self.memory {
+            RegisteredMemory::Individual { memory } => memory.deref_mut() as *mut _,
+            RegisteredMemory::SharedChunk { our_slice, .. } => *our_slice as *mut [T; N],
+        }
     }
 
     fn inner_mr(&self) -> ffi::ibv_mr {
@@ -203,15 +254,8 @@ impl<T, const N: usize> RegisteredMemory<T, N> {
             self.accessed, 0,
             "This memory seems to have already been initialized!"
         );
-        assert!(
-            accessed <= self.capacity(),
-            "Accessing out of range memory."
-        );
+        assert!(accessed <= N, "Accessing out of range memory.");
         self.accessed = accessed;
-    }
-    /// Return total size of memory chunk.
-    pub fn capacity(&self) -> usize {
-        self.memory.len()
     }
 
     pub fn accessed(&self) -> usize {
@@ -221,10 +265,16 @@ impl<T, const N: usize> RegisteredMemory<T, N> {
     /// Return a mutable slice to this memory chunk so it may be written to.
     /// Borrows underlying memory from 0..range.
     pub fn as_mut_slice(&mut self, range: usize) -> &mut [T] {
-        assert!(range <= self.capacity(), "Accessing out of range memory.");
+        assert!(range <= N, "Accessing out of range memory.");
 
         self.accessed = max(range, self.accessed);
-        &mut self.memory[..range]
+        match &mut self.memory {
+            RegisteredMemory::Individual { memory } => &mut memory[..range],
+            RegisteredMemory::SharedChunk { our_slice, .. } => unsafe {
+                let ptr = *our_slice as *mut T;
+                std::slice::from_raw_parts_mut(ptr, N)
+            },
+        }
     }
 }
 
@@ -243,16 +293,20 @@ impl Drop for ProtectionDomain {
 }
 impl ProtectionDomain {
     /// Return a newly allocated array of type T holding N elements.
-    pub fn allocate_memory<T: Copy + Default, const N: usize>(&self) -> RegisteredMemory<T, N> {
+    pub fn allocate_memory<T: Copy + Default, const N: usize>(&self) -> RdmaMemory<T, N> {
         let memory = utils::vec_to_boxed_array();
         self.do_registration(memory)
     }
 
+    /// Register an existing Boxed array of size [T; N] with the RDMA device returning a
+    /// RegisteredMemory of the same size.
+    /// By default RegisteredMemory assumes no memory in the array is registered. So
+    /// `initialized_elements` may be used to specify how many elements are already initialized.
     pub fn register_array<T, const N: usize>(
         &mut self,
         array: Box<[T; N]>,
         initialized_elements: usize,
-    ) -> RegisteredMemory<T, N> {
+    ) -> RdmaMemory<T, N> {
         assert!(array.len() > 0, "No memory allocated for array.");
         assert!(
             initialized_elements < N,
@@ -263,7 +317,7 @@ impl ProtectionDomain {
         memory
     }
 
-    fn do_registration<T, const N: usize>(&self, mut array: Box<[T; N]>) -> RegisteredMemory<T, N> {
+    fn do_registration<T, const N: usize>(&self, mut array: Box<[T; N]>) -> RdmaMemory<T, N> {
         let mr = unsafe {
             ffi::ibv_reg_mr(
                 self.pd as *mut _,
@@ -277,14 +331,18 @@ impl ProtectionDomain {
             panic!("Unable to register_memory");
         }
 
-        RegisteredMemory::new(mr, array)
+        RdmaMemory::new(mr, array)
     }
 
+    /// RDMA NICs can handle large contagious registered memory better than many different memory
+    /// regions. This function allows you to get `number_of_chunks` different RegisteredMemory
+    /// objects that are disjoint regions of the same underlying contagious memory.
+    /// TODO: Generalize to <T> instead of u8.     
     pub fn register_chunk<const SIZE: usize>(
-        &mut self,
-        number_of_chunks: usize,
-    ) -> Vec<RegisteredMemory<u8, SIZE>> {
-        let mut memory: Box<[u8]> = vec![0 as u8; number_of_chunks * SIZE].into_boxed_slice();
+        &self,
+        num_of_chunks: usize,
+    ) -> Vec<RdmaMemory<u8, SIZE>> {
+        let mut memory: Box<[u8]> = vec![0 as u8; num_of_chunks * SIZE].into_boxed_slice();
 
         let mr = unsafe {
             ffi::ibv_reg_mr(
@@ -297,15 +355,18 @@ impl ProtectionDomain {
         if mr == null_mut() {
             panic!("Unable to register_memory");
         }
-        let ptr = Box::into_raw(memory) as *mut u8;
 
-        let mut chunks = Vec::with_capacity(SIZE);
-        let mut current = ptr;
-        for _ in 0..number_of_chunks {
+        let raw_memory: *mut [u8] = Box::into_raw(memory);
+        let mut chunks: Vec<RdmaMemory<u8, SIZE>> = Vec::with_capacity(num_of_chunks);
+        let rc = Rc::new(());
+
+        // Iterate over raw_memory pointer creating new chunks at disjoint memory regions of size
+        // SIZE.
+        let mut current: *mut [u8; SIZE] = raw_memory as *mut [u8; SIZE];
+        for _ in 0..num_of_chunks {
             unsafe {
-                let chunk = Box::from_raw(current as *mut [u8; SIZE]);
-                chunks.push(RegisteredMemory::new(mr, chunk));
-                current = current.add(SIZE);
+                chunks.push(RdmaMemory::new_chunk(mr, raw_memory, current, rc.clone()));
+                current = current.add(1);
             }
         }
 
@@ -386,7 +447,7 @@ pub enum PostSendOpcode {
 impl QueuePair {
     pub fn post_send<'a, I, T, const N: usize>(&mut self, work_requests: I, opcode: PostSendOpcode)
     where
-        I: Iterator<Item = &'a (u64, RegisteredMemory<T, N>)> + ExactSizeIterator,
+        I: Iterator<Item = &'a (u64, RdmaMemory<T, N>)> + ExactSizeIterator,
         T: 'static + Copy,
     {
         self.post_request::<PostSend, I, T, N, 1>(work_requests, opcode)
@@ -394,7 +455,7 @@ impl QueuePair {
 
     pub fn post_receive<'a, I, T, const N: usize>(&mut self, work_requests: I)
     where
-        I: Iterator<Item = &'a (u64, RegisteredMemory<T, N>)> + ExactSizeIterator,
+        I: Iterator<Item = &'a (u64, RdmaMemory<T, N>)> + ExactSizeIterator,
         T: 'static + Copy,
     {
         self.post_request::<PostRecv, I, T, N, 256>(work_requests, ())
@@ -405,7 +466,7 @@ impl QueuePair {
         work_requests: I,
         opcode: <R as Request>::OpCode,
     ) where
-        I: Iterator<Item = &'a (u64, RegisteredMemory<T, N>)> + ExactSizeIterator,
+        I: Iterator<Item = &'a (u64, RdmaMemory<T, N>)> + ExactSizeIterator,
         // Copy because we only want user sending "dumb" data.
         T: 'static + Copy,
         R: Request,
@@ -430,7 +491,7 @@ impl QueuePair {
 
             unsafe {
                 sges.push_unchecked(ffi::ibv_sge {
-                    addr: memory.memory.deref() as *const [T] as *const u8 as u64,
+                    addr: memory.as_ptr() as u64,
                     length,
                     lkey: memory.get_lkey(),
                 });
@@ -467,7 +528,7 @@ trait Request {
         bad_work_request: *mut *mut Self::WorkRequest,
     ) -> i32;
 
-    fn memory_size<T, const N: usize>(memory: &RegisteredMemory<T, N>) -> usize;
+    fn memory_size<T, const N: usize>(memory: &RdmaMemory<T, N>) -> usize;
 
     fn make_work_request(
         wr_id: u64,
@@ -501,7 +562,7 @@ impl Request for PostSend {
     }
 
     /// Only register the memory that has been written to with the device.
-    fn memory_size<T, const N: usize>(memory: &RegisteredMemory<T, N>) -> usize {
+    fn memory_size<T, const N: usize>(memory: &RdmaMemory<T, N>) -> usize {
         memory.accessed()
     }
 
@@ -579,8 +640,8 @@ impl Request for PostRecv {
     }
 
     /// Register the whole memory size with the device.
-    fn memory_size<T, const N: usize>(memory: &RegisteredMemory<T, N>) -> usize {
-        memory.capacity()
+    fn memory_size<T, const N: usize>(_memory: &RdmaMemory<T, N>) -> usize {
+        N
     }
 
     // Post recvs do not care about inline data.
@@ -927,7 +988,7 @@ impl CommunicationManager {
 }
 
 pub struct VolatileRdmaMemory<T, const N: usize> {
-    memory: RegisteredMemory<T, N>,
+    memory: RdmaMemory<T, N>,
 }
 
 impl<T, const N: usize> VolatileRdmaMemory<T, N>
@@ -941,7 +1002,7 @@ where
 
     pub fn as_connection_data(&mut self) -> PeerConnectionData<T, N> {
         PeerConnectionData {
-            remote_address: self.memory.memory.as_mut_ptr(),
+            remote_address: self.memory.as_mut_ptr() as *mut _,
             rkey: self.memory.get_rkey(),
         }
     }

@@ -2,7 +2,7 @@ use nix::sys::socket::{InetAddr, SockAddr};
 use rdma_cm;
 use rdma_cm::error::RdmaCmError;
 use rdma_cm::{
-    CommunicationManager, PeerConnectionData, RdmaCmEvent, RegisteredMemory, VolatileRdmaMemory,
+    CommunicationManager, PeerConnectionData, RdmaCmEvent, RdmaMemory, VolatileRdmaMemory,
 };
 use std::net::SocketAddr;
 use std::ptr::null_mut;
@@ -48,7 +48,7 @@ fn rdma_write_server(server_is_ready: Box<dyn Fn()>) -> Result<(), RdmaCmError> 
     assert_eq!(RdmaCmEvent::Established, event.get_event());
     event.ack();
 
-    let mut memory: RegisteredMemory<u64, 1> = pd.allocate_memory::<u64, 1>();
+    let mut memory: RdmaMemory<u64, 1> = pd.allocate_memory::<u64, 1>();
     memory.as_mut_slice(1)[0] = 42;
     let work = vec![(1, memory)];
 
