@@ -15,10 +15,9 @@ use std::cmp::max;
 use std::io::Error;
 use std::ptr::{null, null_mut};
 
-use std::cell::RefCell;
 use std::ops::{Deref, DerefMut};
 use std::rc::Rc;
-use std::slice::SliceIndex;
+
 #[allow(unused_imports)]
 use tracing::{debug, info, trace};
 
@@ -81,6 +80,7 @@ pub struct CmEvent {
 
 impl Drop for CmEvent {
     fn drop(&mut self) {
+        debug!("{}", function_name!());
         let ret = unsafe { ffi::rdma_ack_cm_event(self.event) };
         // We do NOT want to panic on a destructor.
         if ret == -1 {
@@ -167,6 +167,8 @@ enum RegisteredMemory<T, const N: usize> {
 
 impl<T, const N: usize> Drop for RdmaMemory<T, N> {
     fn drop(&mut self) {
+        debug!("{}", function_name!());
+
         if let RegisteredMemory::SharedChunk {
             starting_address,
             rc,
@@ -284,6 +286,7 @@ pub struct ProtectionDomain {
 
 impl Drop for ProtectionDomain {
     fn drop(&mut self) {
+        debug!("{}", function_name!());
         let ret = unsafe { ffi::ibv_dealloc_pd(self.pd) };
         if ret != 0 {
             let error = Error::last_os_error();
@@ -380,6 +383,7 @@ pub struct CompletionQueue<const POLL_ELEMENTS: usize> {
 
 impl<const POLL_ELEMENTS: usize> Drop for CompletionQueue<POLL_ELEMENTS> {
     fn drop(&mut self) {
+        debug!("{}", function_name!());
         let ret = unsafe { ffi::ibv_destroy_cq(self.cq) };
         if ret != 0 {
             let error = Error::last_os_error();
@@ -423,6 +427,7 @@ struct ibv_qp(*mut ffi::ibv_qp);
 
 impl Drop for ibv_qp {
     fn drop(&mut self) {
+        debug!("{}", function_name!());
         let ret = unsafe { ffi::ibv_destroy_qp(self.0) };
         if ret != 0 {
             let error = Error::last_os_error();
@@ -435,13 +440,6 @@ impl Drop for ibv_qp {
 #[derive(Clone)]
 pub struct QueuePair {
     qp: Rc<ibv_qp>,
-}
-
-/// TODO Carry around type information <T> for the type?
-#[derive(Copy, Clone)]
-pub enum PostSendOpcode {
-    Send,
-    RdmaWrite { rkey: u32, remote_address: *mut u64 },
 }
 
 impl QueuePair {
@@ -540,6 +538,24 @@ trait Request {
     fn link<const N: usize>(requests: &mut ArrayVec<Self::WorkRequest, N>);
 }
 
+/// TODO Carry around type information <T> for the type?
+#[derive(Copy, Clone)]
+pub enum PostSendOpcode {
+    Send,
+    RdmaWrite { rkey: u32, remote_address: *mut u64 },
+    RdmaRead { rkey: u32, remote_address: *mut u64 },
+}
+
+impl PostSendOpcode {
+    fn get_opcode(&self) -> ffi::ibv_wr_opcode {
+        match self {
+            PostSendOpcode::Send => ffi::ibv_wr_opcode_IBV_WR_SEND,
+            PostSendOpcode::RdmaWrite { .. } => ffi::ibv_wr_opcode_IBV_WR_RDMA_WRITE,
+            PostSendOpcode::RdmaRead { .. } => ffi::ibv_wr_opcode_IBV_WR_RDMA_READ,
+        }
+    }
+}
+
 enum PostSend {}
 
 impl Request for PostSend {
@@ -572,23 +588,32 @@ impl Request for PostSend {
         inline: bool,
         opcode: Self::OpCode,
     ) -> Self::WorkRequest {
-        let work_request_template: Self::WorkRequest = unsafe { std::mem::zeroed() };
+        // Zero out before filling with our values.
+        let wr: Self::WorkRequest = unsafe { std::mem::zeroed() };
         let inline = if inline {
             ffi::ibv_send_flags_IBV_SEND_INLINE
         } else {
             0
         };
 
+        // Values universal to all our operations.
+        let mut wr = Self::WorkRequest {
+            wr_id,
+            sg_list,
+            num_sge: 1,
+            send_flags: ffi::ibv_send_flags_IBV_SEND_SIGNALED | inline,
+            opcode: opcode.get_opcode(),
+            ..wr
+        };
+
         match opcode {
-            PostSendOpcode::Send => Self::WorkRequest {
-                wr_id,
-                sg_list,
-                num_sge: 1,
-                opcode: ffi::ibv_wr_opcode_IBV_WR_SEND,
-                send_flags: ffi::ibv_send_flags_IBV_SEND_SIGNALED | inline,
-                ..work_request_template
-            },
+            // Nothing more needs to be done for send.
+            PostSendOpcode::Send => {}
             PostSendOpcode::RdmaWrite {
+                rkey,
+                remote_address,
+            }
+            | PostSendOpcode::RdmaRead {
                 rkey,
                 remote_address,
             } => {
@@ -598,17 +623,10 @@ impl Request for PostSend {
                         rkey,
                     },
                 };
-                Self::WorkRequest {
-                    wr_id,
-                    sg_list,
-                    num_sge: 1,
-                    opcode: ffi::ibv_wr_opcode_IBV_WR_RDMA_WRITE,
-                    wr: rdma,
-                    send_flags: ffi::ibv_send_flags_IBV_SEND_SIGNALED | inline,
-                    ..work_request_template
-                }
+                wr.wr = rdma;
             }
         }
+        wr
     }
 
     fn link<const N: usize>(requests: &mut ArrayVec<Self::WorkRequest, N>) {
@@ -676,6 +694,7 @@ pub struct CommunicationManager {
 
 impl Drop for CommunicationManager {
     fn drop(&mut self) {
+        debug!("{}", function_name!());
         let ret = unsafe { ffi::rdma_destroy_id(self.cm_id) };
         if ret != 0 {
             let error = Error::last_os_error();
@@ -1007,7 +1026,7 @@ where
         }
     }
 
-    pub fn read(&mut self) -> [T; N] {
+    pub fn read(&self) -> [T; N] {
         unsafe { std::ptr::read_volatile(self.memory.as_ptr()) }
     }
 
@@ -1027,6 +1046,13 @@ impl<T, const N: usize> PeerConnectionData<T, N> {
     /// Convinience method for creating the opcode for one-sided RDMA write to peer.
     pub fn as_rdma_write(&self) -> PostSendOpcode {
         PostSendOpcode::RdmaWrite {
+            rkey: self.rkey,
+            remote_address: self.remote_address as *mut u64,
+        }
+    }
+
+    pub fn as_rdma_read(&self) -> PostSendOpcode {
+        PostSendOpcode::RdmaRead {
             rkey: self.rkey,
             remote_address: self.remote_address as *mut u64,
         }
