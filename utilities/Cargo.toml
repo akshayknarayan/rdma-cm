@@ -1,0 +1,10 @@
+[package]
+name = "utilities"
+version = "0.1.0"
+edition = "2018"
+
+
+
+[dependencies]
+rdma-cm = { path ="../"}
+nix = "0.22.1"

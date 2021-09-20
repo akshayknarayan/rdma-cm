@@ -1,6 +1,14 @@
 # rdma-cm
 
-High-level Rust bindings around RDMA-cm. We also include wrappers around ibverbs methods.
+High-level Rust bindings around RDMA-cm. We also include wrappers around ibverbs methods.f
+
+# Dependencies
+
+This crate requires the following external dependencies:
+- **libibverbs-dev**: RDMA library for Infiniband verbs.
+- **librdmacm-dev**: RDMA Communication Manager: Technology agnostic communication layer for RDMA connections.
+- **libclang-dev**: To generate RDMA Rust bindings around ibverbs and rdma_cm headers.
+
 
 ### Why not Rust-ibverbs?
 The Rust [ibverbs](https://github.com/jonhoo/rust-ibverbs) crate already provides high quality, high level bindings to ibverbs.

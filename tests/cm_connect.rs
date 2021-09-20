@@ -1,9 +1,9 @@
-use nix::sys::socket::{InetAddr, SockAddr};
 use rdma_cm;
 use rdma_cm::error::RdmaCmError;
 use rdma_cm::{CommunicationManager, RdmaCmEvent};
 use std::net::SocketAddr;
 use std::ptr::null_mut;
+use nix::sys::socket::{InetAddr, SockAddr};
 
 #[test]
 fn rdma_write() -> rdma_cm::Result<()> {
@@ -48,7 +48,9 @@ fn server(server_is_ready: Box<dyn Fn()>) -> Result<(), RdmaCmError> {
 
 fn client() -> Result<(), RdmaCmError> {
     let cm_connection = CommunicationManager::new()?;
-    let addr_info = CommunicationManager::get_address_info("192.168.1.2", "4000")?;
+    let our_address = utilities::ib_device_ip_address().
+        expect("Could not find IB device IP address.");
+    let addr_info = CommunicationManager::get_address_info(&format!("{}", our_address), "4000")?;
 
     unsafe {
         let mut current = addr_info;
