@@ -165,6 +165,10 @@ enum RegisteredMemory<T, const N: usize> {
     },
 }
 
+/// TODO: We give RdmaMemory directly to the user. If they don't use our IoQueue free function
+/// the memory will truly get dropped via this constructor which is slow!
+/// Instead, this destructor should do the same thing as IoQueue::free and only when the whole
+/// IoQueue is free should we drop the memory.
 impl<T, const N: usize> Drop for RdmaMemory<T, N> {
     fn drop(&mut self) {
         debug!("{}", function_name!());
@@ -262,6 +266,16 @@ impl<T, const N: usize> RdmaMemory<T, N> {
 
     pub fn accessed(&self) -> usize {
         self.accessed
+    }
+
+    pub fn as_slice(&self) -> &[T] {
+        match &self.memory {
+            RegisteredMemory::Individual { memory } => &memory[..self.accessed],
+            RegisteredMemory::SharedChunk { our_slice, .. } => unsafe {
+                let ptr = *our_slice as *const T;
+                std::slice::from_raw_parts(ptr, N)
+            },
+        }
     }
 
     /// Return a mutable slice to this memory chunk so it may be written to.
