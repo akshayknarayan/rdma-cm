@@ -462,7 +462,7 @@ impl QueuePair {
         I: Iterator<Item = &'a (u64, RdmaMemory<T, N>)> + ExactSizeIterator,
         T: 'static + Copy,
     {
-        self.post_request::<PostSend, I, T, N, 1>(work_requests, opcode)
+        self.post_request::<PostSend, I, T, N, 256>(work_requests, opcode)
     }
 
     pub fn post_receive<'a, I, T, const N: usize>(&mut self, work_requests: I)
@@ -490,7 +490,9 @@ impl QueuePair {
         );
         assert!(
             work_requests.len() <= MAX_REQUEST_SIZE,
-            "Too many requests. Max size reached"
+            "Too many requests ({}). Max size reached ({}).",
+            work_requests.len(),
+            MAX_REQUEST_SIZE,
         );
 
         let mut requests: ArrayVec<R::WorkRequest, MAX_REQUEST_SIZE> = ArrayVec::new_const();
