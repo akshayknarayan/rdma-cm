@@ -452,17 +452,19 @@ impl Drop for ibv_qp {
 
 /// Allow QueuePair to be Cloned. This is totally safe.
 #[derive(Clone)]
-pub struct QueuePair {
+pub struct QueuePair<const RQ_SIZE: usize, const SQ_SIZE: usize> {
     qp: Rc<ibv_qp>,
+    // requests: Vec<R::WorkRequest, MAX_REQUEST_SIZE>,
+    // sges: Vec<ffi::ibv_sge, RQ_SIZE>,
 }
 
-impl QueuePair {
+impl<const RQ_SIZE: usize, const SQ_SIZE: usize> QueuePair<RQ_SIZE, SQ_SIZE> {
     pub fn post_send<'a, I, T, const N: usize>(&mut self, work_requests: I, opcode: PostSendOpcode)
     where
         I: Iterator<Item = &'a (u64, RdmaMemory<T, N>)> + ExactSizeIterator,
         T: 'static + Copy,
     {
-        self.post_request::<PostSend, I, T, N, 256>(work_requests, opcode)
+        self.post_request::<PostSend, I, T, N, SQ_SIZE>(work_requests, opcode)
     }
 
     pub fn post_receive<'a, I, T, const N: usize>(&mut self, work_requests: I)
@@ -470,7 +472,7 @@ impl QueuePair {
         I: Iterator<Item = &'a (u64, RdmaMemory<T, N>)> + ExactSizeIterator,
         T: 'static + Copy,
     {
-        self.post_request::<PostRecv, I, T, N, 256>(work_requests, ())
+        self.post_request::<PostRecv, I, T, N, RQ_SIZE>(work_requests, ())
     }
 
     fn post_request<'a, R, I, T, const N: usize, const MAX_REQUEST_SIZE: usize>(
@@ -495,26 +497,22 @@ impl QueuePair {
             MAX_REQUEST_SIZE,
         );
 
-        let mut requests: ArrayVec<R::WorkRequest, MAX_REQUEST_SIZE> = ArrayVec::new_const();
-        let mut sges: ArrayVec<ffi::ibv_sge, MAX_REQUEST_SIZE> = ArrayVec::new_const();
+        let mut requests: Vec<R::WorkRequest> = Vec::with_capacity(work_requests.len());
+        let mut sges: Vec<ffi::ibv_sge> = Vec::with_capacity(work_requests.len());
 
         // Create all entries to fill `sges` and `requests`
         for (i, (work_id, memory)) in work_requests.enumerate() {
             // Total number of bytes to send.
             let length = (R::memory_size(memory) * std::mem::size_of::<T>()) as u32;
-
-            unsafe {
-                sges.push_unchecked(ffi::ibv_sge {
+                sges.push(ffi::ibv_sge {
                     addr: memory.as_ptr() as u64,
                     length,
                     lkey: memory.get_lkey(),
                 });
-            }
 
-            let wr = R::make_work_request(*work_id, &mut sges[i] as *mut _, length <= 512, opcode);
-            unsafe {
-                requests.push_unchecked(wr);
-            }
+            let wr =
+                R::make_work_request(*work_id, &mut sges[i] as *mut _, length <= 512, opcode);
+                requests.push(wr);
         }
 
         // Link all entries together.
@@ -536,8 +534,8 @@ trait Request {
     type WorkRequest;
     type OpCode: Copy;
 
-    fn post(
-        qp: &mut QueuePair,
+    fn post<const RQ_SIZE: usize, const SQ_SIZE: usize>(
+        qp: &mut QueuePair<RQ_SIZE, SQ_SIZE>,
         work_requests: *mut Self::WorkRequest,
         bad_work_request: *mut *mut Self::WorkRequest,
     ) -> i32;
@@ -551,7 +549,7 @@ trait Request {
         opcode: Self::OpCode,
     ) -> Self::WorkRequest;
 
-    fn link<const N: usize>(requests: &mut ArrayVec<Self::WorkRequest, N>);
+    fn link(requests: &mut Vec<Self::WorkRequest>);
 }
 
 /// TODO Carry around type information <T> for the type?
@@ -578,8 +576,8 @@ impl Request for PostSend {
     type WorkRequest = ffi::ibv_send_wr;
     type OpCode = PostSendOpcode;
 
-    fn post(
-        qp: &mut QueuePair,
+    fn post<const RQ_SIZE: usize, const SQ_SIZE: usize>(
+        qp: &mut QueuePair<RQ_SIZE, SQ_SIZE>,
         work_requests: *mut Self::WorkRequest,
         bad_work_request: *mut *mut Self::WorkRequest,
     ) -> i32 {
@@ -645,7 +643,7 @@ impl Request for PostSend {
         wr
     }
 
-    fn link<const N: usize>(requests: &mut ArrayVec<Self::WorkRequest, N>) {
+    fn link(requests: &mut Vec<Self::WorkRequest>) {
         for i in 0..requests.len() - 1 {
             requests[i].next = &mut requests[i + 1] as *mut ffi::ibv_send_wr;
         }
@@ -658,8 +656,8 @@ impl Request for PostRecv {
     type WorkRequest = ffi::ibv_recv_wr;
     type OpCode = ();
 
-    fn post(
-        qp: &mut QueuePair,
+    fn post<const RQ_SIZE: usize, const SQ_SIZE: usize>(
+        qp: &mut QueuePair<RQ_SIZE, SQ_SIZE>,
         work_requests: *mut Self::WorkRequest,
         bad_work_request: *mut *mut Self::WorkRequest,
     ) -> i32 {
@@ -693,7 +691,7 @@ impl Request for PostRecv {
         }
     }
 
-    fn link<const N: usize>(requests: &mut ArrayVec<Self::WorkRequest, N>) {
+    fn link(requests: &mut Vec<Self::WorkRequest>) {
         for i in 0..requests.len() - 1 {
             requests[i].next = &mut requests[i + 1] as *mut Self::WorkRequest;
         }
@@ -794,14 +792,14 @@ impl CommunicationManager {
             return Err(RdmaCmError::CreateCompletionQueue(Error::last_os_error()));
         }
 
-        Ok(CompletionQueue { cq })
+        Ok(CompletionQueue { cq})
     }
 
-    pub fn create_qp<const ELEMENTS: usize>(
+    pub fn create_qp<const RQ_SIZE: usize, const SQ_SIZE: usize, const ELEMENTS: usize>(
         &self,
         pd: &ProtectionDomain,
         cq: &CompletionQueue<ELEMENTS>,
-    ) -> QueuePair {
+    ) -> QueuePair<RQ_SIZE, SQ_SIZE> {
         info!("{}", function_name!());
 
         let qp_init_attr: ffi::ibv_qp_init_attr = ffi::ibv_qp_init_attr {
@@ -810,8 +808,8 @@ impl CommunicationManager {
             recv_cq: cq.cq,
             srq: null_mut(),
             cap: ffi::ibv_qp_cap {
-                max_send_wr: 256,
-                max_recv_wr: 256,
+                max_send_wr: SQ_SIZE as u32,
+                max_recv_wr: RQ_SIZE as u32,
                 max_send_sge: 10,
                 max_recv_sge: 10,
                 max_inline_data: 512,
