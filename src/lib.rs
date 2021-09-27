@@ -452,19 +452,19 @@ impl Drop for ibv_qp {
 
 /// Allow QueuePair to be Cloned. This is totally safe.
 #[derive(Clone)]
-pub struct QueuePair<const RQ_SIZE: usize, const SQ_SIZE: usize> {
+pub struct QueuePair<const RECV_WRS: usize, const SEND_WRS: usize> {
     qp: Rc<ibv_qp>,
     // requests: Vec<R::WorkRequest, MAX_REQUEST_SIZE>,
     // sges: Vec<ffi::ibv_sge, RQ_SIZE>,
 }
 
-impl<const RQ_SIZE: usize, const SQ_SIZE: usize> QueuePair<RQ_SIZE, SQ_SIZE> {
+impl<const RECV_WRS: usize, const SEND_WRS: usize> QueuePair<RECV_WRS, SEND_WRS> {
     pub fn post_send<'a, I, T, const N: usize>(&mut self, work_requests: I, opcode: PostSendOpcode)
     where
         I: Iterator<Item = &'a (u64, RdmaMemory<T, N>)> + ExactSizeIterator,
         T: 'static + Copy,
     {
-        self.post_request::<PostSend, I, T, N, SQ_SIZE>(work_requests, opcode)
+        self.post_request::<PostSend, I, T, N, SEND_WRS>(work_requests, opcode)
     }
 
     pub fn post_receive<'a, I, T, const N: usize>(&mut self, work_requests: I)
@@ -472,7 +472,7 @@ impl<const RQ_SIZE: usize, const SQ_SIZE: usize> QueuePair<RQ_SIZE, SQ_SIZE> {
         I: Iterator<Item = &'a (u64, RdmaMemory<T, N>)> + ExactSizeIterator,
         T: 'static + Copy,
     {
-        self.post_request::<PostRecv, I, T, N, RQ_SIZE>(work_requests, ())
+        self.post_request::<PostRecv, I, T, N, RECV_WRS>(work_requests, ())
     }
 
     fn post_request<'a, R, I, T, const N: usize, const MAX_REQUEST_SIZE: usize>(
