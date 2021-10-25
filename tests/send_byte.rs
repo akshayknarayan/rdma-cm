@@ -38,7 +38,7 @@ fn rdma_send_byte_server(server_is_ready: Box<dyn Fn()>) -> Result<(), RdmaCmErr
 
     let pd = connected_id.allocate_protection_domain()?;
     let cq = connected_id.create_cq::<100>()?;
-    let mut qp = connected_id.create_qp(&pd, &cq);
+    let mut qp = connected_id.create_qp::<128, 128, 100>(&pd, &cq);
 
     connected_id.accept()?;
     let event = listening_id.get_cm_event()?;
@@ -98,7 +98,7 @@ fn rdma_send_byte_client() -> Result<(), RdmaCmError> {
 
     let pd = cm_connection.allocate_protection_domain()?;
     let cq = cm_connection.create_cq::<100>()?;
-    let mut qp = cm_connection.create_qp(&pd, &cq);
+    let mut qp = cm_connection.create_qp::<128, 128, 100>(&pd, &cq);
     cm_connection.connect()?;
 
     let event = cm_connection.get_cm_event()?;

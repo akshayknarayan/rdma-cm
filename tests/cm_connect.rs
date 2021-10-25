@@ -30,7 +30,7 @@ fn server(server_is_ready: Box<dyn Fn()>) -> Result<(), RdmaCmError> {
 
     let pd = connected_id.allocate_protection_domain()?;
     let cq = connected_id.create_cq::<100>()?;
-    let _qp = connected_id.create_qp(&pd, &cq);
+    let _qp = connected_id.create_qp::<128, 128, 100>(&pd, &cq);
 
     connected_id.accept()?;
     let event = listening_id.get_cm_event()?;
@@ -75,7 +75,7 @@ fn client() -> Result<(), RdmaCmError> {
 
     let pd = cm_connection.allocate_protection_domain()?;
     let cq = cm_connection.create_cq::<100>()?;
-    let _qp = cm_connection.create_qp(&pd, &cq);
+    let _qp = cm_connection.create_qp::<128, 128, 100>(&pd, &cq);
 
     cm_connection.connect()?;
 

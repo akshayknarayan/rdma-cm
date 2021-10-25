@@ -1,4 +1,3 @@
-#[allow()]
 pub mod error;
 pub mod ffi;
 mod utils;
@@ -776,13 +775,13 @@ impl CommunicationManager {
         Ok(ProtectionDomain { pd })
     }
 
-    pub fn create_cq<const ELEMENTS: usize>(&self) -> Result<CompletionQueue<ELEMENTS>> {
+    pub fn create_cq<const CQ_SIZE: usize>(&self) -> Result<CompletionQueue<CQ_SIZE>> {
         info!("{}", function_name!());
 
         let cq = unsafe {
             ffi::ibv_create_cq(
                 self.get_raw_verbs_context(),
-                ELEMENTS as i32,
+                CQ_SIZE as i32,
                 null_mut(),
                 null_mut(),
                 0,
@@ -795,10 +794,10 @@ impl CommunicationManager {
         Ok(CompletionQueue { cq})
     }
 
-    pub fn create_qp<const RQ_SIZE: usize, const SQ_SIZE: usize, const ELEMENTS: usize>(
+    pub fn create_qp<const RQ_SIZE: usize, const SQ_SIZE: usize, const CQ_SIZE: usize>(
         &self,
         pd: &ProtectionDomain,
-        cq: &CompletionQueue<ELEMENTS>,
+        cq: &CompletionQueue<CQ_SIZE>,
     ) -> QueuePair<RQ_SIZE, SQ_SIZE> {
         info!("{}", function_name!());
 
