@@ -72,7 +72,7 @@ impl TryFrom<u32> for RdmaCmEvent {
     }
 }
 
-/// This is a single event.
+/// Single RDMA-cm event wrapping the `rdma_cm_event` type. Acks messages on destructor call.
 pub struct CmEvent {
     event: *mut ffi::rdma_cm_event,
 }
@@ -84,7 +84,7 @@ impl Drop for CmEvent {
         // We do NOT want to panic on a destructor.
         if ret == -1 {
             let error = Error::last_os_error();
-            println!("Unable to rdma_ack_cm_event: {}", error);
+            eprintln!("Unable to rdma_ack_cm_event: {}", error);
         }
     }
 }
@@ -143,6 +143,12 @@ impl CmEvent {
     }
 }
 
+/// Represents a piece of memory that has been registered with the RDMA-enabled NIC.
+///
+/// This memory has been registered for IBV_ACCESS_REMOTE_WRITE and IBV_ACCESS_LOCAL_WRITE.
+///
+/// Automatically deregistered on drop. May individually registered with the RDMA device or a piece
+/// of a larger chunk of memory registered with the RDMA-enabled NIC.
 pub struct RdmaMemory<T, const N: usize> {
     memory: RegisteredMemory<T, N>,
     /// Amounts of bytes actually accessed. Allows us to only send the bytes actually accessed by
@@ -164,10 +170,6 @@ enum RegisteredMemory<T, const N: usize> {
     },
 }
 
-/// TODO: We give RdmaMemory directly to the user. If they don't use our IoQueue free function
-/// the memory will truly get dropped via this constructor which is slow!
-/// Instead, this destructor should do the same thing as IoQueue::free and only when the whole
-/// IoQueue is free should we drop the memory.
 impl<T, const N: usize> Drop for RdmaMemory<T, N> {
     fn drop(&mut self) {
         debug!("{}", function_name!());
@@ -293,6 +295,7 @@ impl<T, const N: usize> RdmaMemory<T, N> {
     }
 }
 
+/// High-level wrapper around ibv_pd.
 pub struct ProtectionDomain {
     pd: *mut ffi::ibv_pd,
 }
@@ -390,6 +393,9 @@ impl ProtectionDomain {
     }
 }
 
+/// The RDMA event completion queue.
+/// # Const Generics
+/// * `POLL_ELEMENTS` - Max number of events that will be polled in completion queue.
 pub struct CompletionQueue<const POLL_ELEMENTS: usize> {
     cq: *mut ffi::ibv_cq,
 }
@@ -449,12 +455,15 @@ impl Drop for ibv_qp {
     }
 }
 
-/// Allow QueuePair to be Cloned. This is totally safe.
+// Allow QueuePair to be Cloned. This is totally safe.
 #[derive(Clone)]
+/// Wrapper around a RDMA queue pair.
+/// # Const Generics
+///
+/// * `RECV_WRS` - Max number of receive work requests that can be posted at once.
+/// * `SEND_WRS` - Max number of send work requests that can be posted at once.
 pub struct QueuePair<const RECV_WRS: usize, const SEND_WRS: usize> {
     qp: Rc<ibv_qp>,
-    // requests: Vec<R::WorkRequest, MAX_REQUEST_SIZE>,
-    // sges: Vec<ffi::ibv_sge, RQ_SIZE>,
 }
 
 impl<const RECV_WRS: usize, const SEND_WRS: usize> QueuePair<RECV_WRS, SEND_WRS> {
@@ -697,7 +706,7 @@ impl Request for PostRecv {
     }
 }
 
-/// Uses rdma-cm to manage multiple connections.
+/// High-level wrapper around an `rdma_cm_id`.
 pub struct CommunicationManager {
     cm_id: *mut ffi::rdma_cm_id,
     /// If the CommunicationManager is used for connecting two nodes it needs an event channel.
@@ -1019,6 +1028,8 @@ impl CommunicationManager {
     }
 }
 
+/// Memory registered with the RDMA-enabled NIC. Marked as volatile as other side my write to it at
+/// any time. So we use `write_volatile` and `read_volatile` when accessing it.
 pub struct VolatileRdmaMemory<T, const N: usize> {
     memory: RdmaMemory<T, N>,
 }
@@ -1048,7 +1059,7 @@ where
     }
 }
 
-/// Data necessary for one-sided RDMA to read/write to peer.
+/// User defined data sent during rdma-cm handshake.
 #[derive(Clone, Copy, Debug)]
 pub struct PeerConnectionData<T, const N: usize> {
     remote_address: *mut T,
@@ -1056,7 +1067,7 @@ pub struct PeerConnectionData<T, const N: usize> {
 }
 
 impl<T, const N: usize> PeerConnectionData<T, N> {
-    /// Convinience method for creating the opcode for one-sided RDMA write to peer.
+    /// Convenience method for creating the opcode for one-sided RDMA write to peer.
     pub fn as_rdma_write(&self) -> PostSendOpcode {
         PostSendOpcode::RdmaWrite {
             rkey: self.rkey,
