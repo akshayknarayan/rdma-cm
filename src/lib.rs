@@ -731,36 +731,67 @@ impl<const B: bool> Drop for CommunicationManager<B> {
     }
 }
 
+/// Make a CommunicationManager, which can be either blocking (the default) or nonblocking (by
+/// calling [`Self::async_cm_events`].
+pub struct CommunicationManagerBuilder<const USE_ASYNC: bool>;
+
+impl Default for CommunicationManagerBuilder<false> {
+    fn default() -> Self {
+        Self
+    }
+}
+
+impl CommunicationManagerBuilder<false> {
+    pub fn async_cm_events(self) -> CommunicationManagerBuilder<true> {
+        CommunicationManagerBuilder
+    }
+
+    pub fn build(self) -> Result<CommunicationManager<true>> {
+        CommunicationManager::<true>::new()
+    }
+}
+
+impl CommunicationManagerBuilder<true> {
+    pub fn build(self) -> Result<CommunicationManager<false>> {
+        CommunicationManager::<false>::new()
+    }
+}
+
+fn make_cm_internals() -> Result<(*mut ffi::rdma_cm_id, *mut ffi::rdma_event_channel)> {
+    let event_channel: *mut ffi::rdma_event_channel = unsafe { ffi::rdma_create_event_channel() };
+    if event_channel == null_mut() {
+        return Err(RdmaCmError::RdmaEventChannel(Error::last_os_error()));
+    }
+
+    let mut id: MaybeUninit<*mut ffi::rdma_cm_id> = MaybeUninit::uninit();
+    let ret = unsafe {
+        ffi::rdma_create_id(
+            event_channel,
+            id.as_mut_ptr(),
+            null_mut(),
+            ffi::rdma_port_space_RDMA_PS_TCP,
+        )
+    };
+    if ret == -1 {
+        return Err(RdmaCmError::RdmaCreateId(Error::last_os_error()));
+    }
+
+    Ok((unsafe { id.assume_init() }, event_channel))
+}
+
 impl CommunicationManager<true> {
     pub fn new() -> Result<Self> {
         info!("{}", function_name!());
-
-        let event_channel: *mut ffi::rdma_event_channel =
-            unsafe { ffi::rdma_create_event_channel() };
-        if event_channel == null_mut() {
-            return Err(RdmaCmError::RdmaEventChannel(Error::last_os_error()));
-        }
-
-        let mut id: MaybeUninit<*mut ffi::rdma_cm_id> = MaybeUninit::uninit();
-        let ret = unsafe {
-            ffi::rdma_create_id(
-                event_channel,
-                id.as_mut_ptr(),
-                null_mut(),
-                ffi::rdma_port_space_RDMA_PS_TCP,
-            )
-        };
-        if ret == -1 {
-            return Err(RdmaCmError::RdmaCreateId(Error::last_os_error()));
-        }
-
+        let (cm_id, event_channel) = make_cm_internals()?;
         Ok(CommunicationManager {
-            cm_id: unsafe { id.assume_init() },
+            cm_id,
             event_channel: Some(event_channel),
         })
     }
+}
 
-    /// Set `O_NONBLOCK` on rdma-cm's event channel's fd.
+impl CommunicationManager<false> {
+    /// Make an async CommunicationManager.
     ///
     /// Almost all of this crate's api is async: we submit events to rdma-cm and the corresponding operations
     /// don't block. By default, though, `rdma_get_cm_event` blocks. From the manpage:
@@ -769,24 +800,22 @@ impl CommunicationManager<true> {
     ///   Retrieves a communication event. If no events are pending, by default, the call will block until an event is received.
     ///   ...The default synchronous behavior of this routine can be changed by modifying the file descriptor associated with the given channel.
     ///
-    /// This is exactly what this function does. Correspondingly, [`get_cm_event`] will return a
-    /// future which will resolve when the event is ready.
+    /// This is exactly what this function does: set `O_NONBLOCK` on the underlying event channel's
+    /// fd, via `fcntl`. Correspondingly, [`get_cm_event`] will return a future which will resolve
+    /// when the event is ready.
     ///
     /// This function requires the `async` feature, which is activated by default.
     #[cfg(feature = "async")]
-    pub fn async_cm_events(self) -> Result<CommunicationManager<false>> {
-        if self.event_channel.is_none() {
-            return Err(RdmaCmError::SetAsync);
-        }
-
+    pub fn new() -> Result<CommunicationManager<false>> {
+        let (cm_id, event_channel) = make_cm_internals()?;
         nix::fcntl::fcntl(
-            unsafe { (*self.event_channel.unwrap()).fd },
+            unsafe { (*event_channel).fd },
             nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK),
         )
         .map_err(RdmaCmError::Fcntl)?;
         Ok(CommunicationManager {
-            cm_id: self.cm_id,
-            event_channel: self.event_channel,
+            cm_id,
+            event_channel: Some(event_channel),
         })
     }
 }
