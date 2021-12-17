@@ -3,13 +3,16 @@ name = "rdma-cm"
 version = "0.1.0"
 edition = "2018"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[features]
+default = ["async"]
+async = ["tokio"]
 
 [dependencies]
 tracing = "0.1.26"
-nix = "0.21"
+nix = "0.23"
 arrayvec = "0.7.1"
 thiserror = "1.0.29"
+tokio = { version = "1", features = ["net"], optional = true }
 
 [build-dependencies]
 bindgen = "0.59.1"
