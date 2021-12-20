@@ -742,6 +742,7 @@ impl Default for CommunicationManagerBuilder<false> {
 }
 
 impl CommunicationManagerBuilder<false> {
+    #[cfg(feature = "async")]
     pub fn async_cm_events(self) -> CommunicationManagerBuilder<true> {
         CommunicationManagerBuilder
     }
@@ -1207,6 +1208,15 @@ impl<T, const N: usize> PeerConnectionData<T, N> {
             rkey: self.rkey,
             remote_address: self.remote_address as *mut u64,
         }
+    }
+}
+
+impl<T: Clone, const N: usize> PeerConnectionData<T, N> {
+    pub fn get_remote_address(&self) -> T {
+        // safety: remote_address must be initialized, which is guaranteed by the API.
+        // The only place we construct a PeerConnectionData is `as_connection_data` above, which
+        // initializes the field.
+        unsafe { (*self.remote_address).clone() }
     }
 }
 
